@@ -1,0 +1,7 @@
+datasets
+git+https://github.com/karpathy/minGPT.git@master
+numpy
+pyaml
+tensorboard
+torch
+tqdm
