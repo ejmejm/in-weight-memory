@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -70,27 +71,70 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+class ParallelLinear(nn.Module):
+    """ A linear layer that keeps separate weights for each element in the batch """
+
+    def __init__(self, in_features: int, out_features: int, batch_size: int, bias: bool = True):
+        super().__init__()
+        self.batch_size = batch_size
+        self.out_features = out_features
+        self.layers = nn.ModuleList([
+            nn.Linear(in_features, out_features, bias=bias)
+            for _ in range(batch_size)
+        ])
+
+    def forward(self, x: torch.Tensor):
+        if self.out_features == 0:
+            return torch.zeros((x.shape[0], x.shape[1], self.out_features), device=x.device, dtype=x.dtype)
+
+        assert x.shape[0] == self.batch_size, \
+            f"There are {self.batch_size} memory stores, but got a batch of {x.shape[0]} inputs"
+
+        futures: List[torch.jit.Future[torch.Tensor]] = []
+        for i, layer in enumerate(self.layers):
+            futures.append(torch.jit.fork(layer, x[i]))
+
+        results: List[torch.Tensor] = []
+        for future in futures:
+            results.append(torch.jit.wait(future))
+
+        return torch.stack(results)
+
+        
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
     def __init__(self, config):
         super().__init__()
+        self.n_embd = config.n_embd
+        self.fc_mem_dim = config.fc_mem_dim
+        # The numbers of memory layers is adjusted on the fly in the GPT class
+        self.n_mem_layers = 0
+
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
-            act     = NewGELU(),
-            dropout = nn.Dropout(config.resid_pdrop),
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd + config.fc_mem_dim, config.n_embd)
+        self.act = NewGELU()
+        self.dropout = nn.Dropout(config.resid_pdrop)
+
+        self.reset_memory()
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+        z = self.c_fc(x)
+        z_mem = self.c_fc_mem(x)
+        z = torch.cat((z, z_mem), dim=2)
+
+        x = x + self.dropout(self.c_proj(self.act(z)))
         return x
+    
+    def reset_memory(self, n: Optional[int] = None):
+        n = self.n_mem_layers if n is None else n
+        self.c_fc_mem = torch.jit.script(ParallelLinear(self.n_embd, self.fc_mem_dim, n))
+
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -110,6 +154,7 @@ class GPT(nn.Module):
         C.embd_pdrop = 0.1
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
+        C.fc_mem_dim = 0 # Fully connected memory units
         return C
 
     def __init__(self, config):
@@ -117,6 +162,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.optimizer = None
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -231,7 +277,11 @@ class GPT(nn.Module):
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
+                
+                # Skip memory parameters
+                if 'c_fc_mem' in fpn:
+                    continue
+                elif pn.endswith('bias'):
                     # all biases will not be decayed
                     no_decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
@@ -251,11 +301,42 @@ class GPT(nn.Module):
 
         # create the pytorch optimizer object
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+            {
+                "params": [param_dict[pn] for pn in sorted(list(decay))],
+                "weight_decay": train_config.weight_decay,
+                "name": "weight_decay",
+            },
+            {
+                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
+                "weight_decay": 0.0,
+                "name": "no_weight_decay",
+            },
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
-        return optimizer
+        self.optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        return self.optimizer
+
+    def update_memory_optimizer(self):
+        if self.optimizer is None:
+            raise ValueError("Optimizer must be initialized before modifying the memory!")
+
+        # First delete optimizer memory param group if it exists
+        for i, group in enumerate(self.optimizer.param_groups):
+            if group['name'] == 'memory':
+                del self.optimizer.param_groups[i]
+                break
+
+        # Retrieve the memory parameters and add them to the optimizer
+        mem_params = [param for name, param in self.named_parameters() if 'c_fc_mem' in name]
+        self.optimizer.add_param_group({
+            "params": mem_params,
+            "weight_decay": 0.0,
+            "name": "memory",
+        })
+
+    def reset_memory(self, n: int):
+        for block in self.transformer.h:
+            block.reset_memory(n)
+        self.update_memory_optimizer()
 
     def forward(self, idx, targets=None):
         device = idx.device
