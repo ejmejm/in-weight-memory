@@ -36,7 +36,20 @@ if __name__ == '__main__':
     wandb.init(project=config.system.project, sync_tensorboard=True,
                config=config.to_dict(), tags=tags)
 
-  logger = None
+
+  ### Set up logging ###
+
+  # Set log dir to a random new folder in $SLURM_TMPDIR if running on a cluster
+  random.seed()
+  rand_dir_name = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+  log_dir = os.environ.get('SLURM_TMPDIR') or './runs'
+  log_dir = os.path.join(log_dir, rand_dir_name)
+  print(f'Logging to {log_dir}')
+
+  os.makedirs(log_dir, exist_ok=True)
+  logger = SummaryWriter(log_dir=log_dir)
+
+  logger.add_text('config', str(config))
 
 
   ### Set the seed ###
