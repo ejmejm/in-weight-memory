@@ -57,7 +57,15 @@ class CfgNode:
         return { k: v.to_dict() if isinstance(v, CfgNode) else v for k, v in self.__dict__.items() }
 
     def merge_from_dict(self, d):
-        self.__dict__.update(d)
+        for key, val in d.items():
+            keys = key.split('.')
+            obj = self
+            for k in keys[:-1]:
+                if not hasattr(obj, k):
+                    obj[k] = CfgNode()
+                obj = getattr(obj, k) 
+            leaf_key = keys[-1]
+            setattr(obj, leaf_key, val)
 
     def merge_from_args(self, args):
         """

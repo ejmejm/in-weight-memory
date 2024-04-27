@@ -143,7 +143,7 @@ class GPT(nn.Module):
     def get_default_config():
         C = CN()
         # either model_type or (n_layer, n_head, n_embd) must be given in the config
-        C.model_type = 'gpt'
+        C.model_type = 'gpt-nano'
         C.n_layer = None
         C.n_head = None
         C.n_embd =  None
