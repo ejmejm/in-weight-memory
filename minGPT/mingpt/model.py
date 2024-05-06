@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 from typing import List, Optional
+import warnings
 
 import torch
 import torch.nn as nn
@@ -72,34 +73,33 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class ParallelLinear(nn.Module):
+class BatchLinear(nn.Module):
     """ A linear layer that keeps separate weights for each element in the batch """
 
     def __init__(self, in_features: int, out_features: int, batch_size: int, bias: bool = True):
         super().__init__()
         self.batch_size = batch_size
         self.out_features = out_features
-        self.layers = nn.ModuleList([
-            nn.Linear(in_features, out_features, bias=bias)
-            for _ in range(batch_size)
-        ])
+        self.weights = nn.Parameter(torch.zeros((batch_size, in_features, out_features)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros((batch_size, 1, out_features)))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.out_features == 0:
             return torch.zeros((x.shape[0], x.shape[1], self.out_features), device=x.device, dtype=x.dtype)
 
         assert x.shape[0] == self.batch_size, \
             f"There are {self.batch_size} memory stores, but got a batch of {x.shape[0]} inputs"
 
-        futures: List[torch.jit.Future[torch.Tensor]] = []
-        for i, layer in enumerate(self.layers):
-            futures.append(torch.jit.fork(layer, x[i]))
-
-        results: List[torch.Tensor] = []
-        for future in futures:
-            results.append(torch.jit.wait(future))
-
-        return torch.stack(results)
+        return torch.baddbmm(self.bias, x, self.weights)
+    
+    def reset_parameters(self):
+        nn.init.zeros_(self.weights)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
         
 class Block(nn.Module):
@@ -116,6 +116,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_fc_mem = None
         self.c_proj = nn.Linear(4 * config.n_embd + config.fc_mem_dim, config.n_embd)
         self.act = NewGELU()
         self.dropout = nn.Dropout(config.resid_pdrop)
@@ -127,13 +128,21 @@ class Block(nn.Module):
         z = self.c_fc(x)
         z_mem = self.c_fc_mem(x)
         z = torch.cat((z, z_mem), dim=2)
-
         x = x + self.dropout(self.c_proj(self.act(z)))
         return x
     
     def reset_memory(self, n: Optional[int] = None):
         n = self.n_mem_layers if n is None else n
-        self.c_fc_mem = torch.jit.script(ParallelLinear(self.n_embd, self.fc_mem_dim, n))
+
+        # Check if we can reuse the previous memory layers
+        if self.c_fc_mem is None or n != self.c_fc_mem.batch_size:
+            # Create new layers if we need to
+            self.c_fc_mem = BatchLinear(self.n_embd, self.fc_mem_dim, n)
+            device = next(self.parameters()).device
+            self.c_fc_mem = self.c_fc_mem.to(device)
+        else:
+            # Reset the parameters
+            self.c_fc_mem.reset_parameters()
 
 
 class GPT(nn.Module):
@@ -292,7 +301,7 @@ class GPT(nn.Module):
                     no_decay.add(fpn)
 
         # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in self.named_parameters() if 'c_fc_mem' not in pn}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
@@ -330,6 +339,7 @@ class GPT(nn.Module):
         self.optimizer.add_param_group({
             "params": mem_params,
             "weight_decay": 0.0,
+            "lr": 1e-3,
             "name": "memory",
         })
 

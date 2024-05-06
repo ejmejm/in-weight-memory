@@ -71,6 +71,14 @@ EPSILON = 1e-7
 #   return total_loss / total_count
 
 
+def get_mem_weights(model):
+  mem_weights = []
+  for block in model.transformer.h:
+    for layer in block.c_fc_mem.layers:
+      mem_weights.append(layer.weight.data)
+  return torch.stack(mem_weights)
+
+
 def train_loop(
     model,
     optimizer,
@@ -102,6 +110,7 @@ def train_loop(
   # Data queue is a list of input, output sequence pairs
   data_iter = iter(dataloaders['train'])
   curr_sequences = next(data_iter)
+  model.reset_memory(len(curr_sequences['input_ids']))
 
   epoch = 0
   while epoch < train_config.epochs:
@@ -109,6 +118,8 @@ def train_loop(
     if curr_sequences['input_ids'].shape[1] == 0:
       try:
         curr_sequences = next(data_iter)
+        # print('-- reset memories --')
+        model.reset_memory(len(curr_sequences['input_ids']))
         sample_iter += curr_sequences['input_ids'].shape[0]
       except StopIteration:
         data_iter = iter(dataloaders['train'])
@@ -121,6 +132,7 @@ def train_loop(
 
     batch_iter += 1
 
+    # TODO: Fix this error with called even when grad accumulation steps is not 1
     model.zero_grad(set_to_none=True)
 
     with mp_ctx:
@@ -150,11 +162,17 @@ def train_loop(
     
     # Apply weight update
     if batch_iter % gradient_accumulation_steps == 0:
+      old_mem_weights = copy.deepcopy(get_mem_weights(model))
       if fp16:
         scaler.step(optimizer)
         scaler.update()
       else:
         optimizer.step()
+      new_mem_weights = get_mem_weights(model)
+
+      # Print difference in memory weights
+      # print('Old weight avg:', old_mem_weights.abs().mean())
+      # print('Change frac:', ((new_mem_weights - old_mem_weights) / (old_mem_weights + EPSILON)).abs().mean())
 
     # Keep track of vars to log
     loss_hist.append(loss.item())
