@@ -5,3 +5,5 @@ pyaml
 tensorboard
 torch
 tqdm
+wandb
+matplotlib

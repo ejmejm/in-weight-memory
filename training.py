@@ -15,42 +15,6 @@ from mingpt.model import GPT
 EPSILON = 1e-7
 
 
-# def log_examples(model, dataloader, tokenizer, logger, config, iter_idx=None):
-#   model.eval()
-  
-#   with torch.no_grad():
-
-#     n_samples = 0
-
-#     # Prediction and generation examples
-#     for batch in dataloader:
-#       batch = [t[:config.n_examples].to(config.device) for t in batch]
-#       x, y, _ = batch
-#       logits, _ = model(x, y)
-
-#       # Turn logits into tokens, and log to tensorboard
-#       # Shows the model's prediction and the target
-#       tokens = torch.argmax(logits, dim=-1)
-#       tokens = tokens.cpu()
-      
-#       preds = [tokenizer.decode(t, merge=False) for t in tokens]
-#       targets = [tokenizer.decode(t, merge=False) for t in y.cpu()]
-
-#       pad_token = tokenizer.pad_token
-#       preds = [s[:s.index(pad_token)] if pad_token in s else s for s in preds]
-#       targets = [s[:s.index(pad_token)] if pad_token in s else s for s in targets]
-
-#       preds = [''.join(s) for s in preds]
-#       targets = [''.join(s) for s in targets]
-
-#       for i in range(len(preds)):
-#         logger.add_text(
-#           'examples', f'Target: {targets[i]}\nPrediction: {preds[i]}', iter_idx)
-        
-#       n_samples += x.shape[0]
-#       if n_samples >= config.n_examples:
-#         break
-
 # def eval_model(model, dataloader, train_config):
 #   model.eval()
 #   total_loss = 0
@@ -118,7 +82,6 @@ def train_loop(
     if curr_sequences['input_ids'].shape[1] == 0:
       try:
         curr_sequences = next(data_iter)
-        # print('-- reset memories --')
         model.reset_memory(len(curr_sequences['input_ids']))
         sample_iter += curr_sequences['input_ids'].shape[0]
       except StopIteration:
@@ -162,17 +125,11 @@ def train_loop(
     
     # Apply weight update
     if batch_iter % gradient_accumulation_steps == 0:
-      old_mem_weights = copy.deepcopy(get_mem_weights(model))
       if fp16:
         scaler.step(optimizer)
         scaler.update()
       else:
         optimizer.step()
-      new_mem_weights = get_mem_weights(model)
-
-      # Print difference in memory weights
-      # print('Old weight avg:', old_mem_weights.abs().mean())
-      # print('Change frac:', ((new_mem_weights - old_mem_weights) / (old_mem_weights + EPSILON)).abs().mean())
 
     # Keep track of vars to log
     loss_hist.append(loss.item())
