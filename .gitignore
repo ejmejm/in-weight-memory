@@ -1,2 +1,5 @@
-**.ipynb_checkpoints/
-**__pycache__/
+legacy/
+**/__pycache__/
+.vscode/
+
+lstm_scaling_experiment.ipynb
