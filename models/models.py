@@ -7,12 +7,12 @@ import jax
 from jax import Array
 import jax.numpy as jnp
 
-# from .slstm import sLSTMCell
-# from .mlstm import mLSTMCell
+from .slstm import sLSTMBlock, sLSTMCell
+from .mlstm import mLSTMCell
 
 
 LSTMState = Tuple[Tuple[Array]]
-LSTM_CLS = nn.LSTMCell
+LSTM_CLS = sLSTMBlock # nn.LSTMCell
 
 
 class SupervisedModel(eqx.Module):
@@ -68,12 +68,7 @@ class SupervisedModel(eqx.Module):
                 jnp.zeros(self.layer_sizes[i + 1]))
                 for i in self.recurrent_layer_indices
             ])
-        elif LSTM_CLS == sLSTMCell:
-            return tuple([
-                self.layers[i].init_state()
-                for i in self.recurrent_layer_indices
-            ])
-        elif LSTM_CLS == mLSTMCell:
+        else:
             return tuple([
                 self.layers[i].init_state()
                 for i in self.recurrent_layer_indices
@@ -93,9 +88,12 @@ class SupervisedModel(eqx.Module):
 
             if i in self.recurrent_layer_indices:
                 rnn_state_i = rnn_state[recurrent_layer_idx]
-                out_rnn_state = layer(z, rnn_state_i)
+                if LSTM_CLS == sLSTMBlock:
+                    out_rnn_state, z = layer(z, rnn_state_i)
+                else:
+                    out_rnn_state = layer(z, rnn_state_i)
+                    z = out_rnn_state[0].flatten()
                 new_rnn_state.append(out_rnn_state)
-                z = (out_rnn_state[0]).flatten()
                 recurrent_layer_idx += 1
             else:
                 z = layer(z)

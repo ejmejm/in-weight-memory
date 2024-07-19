@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import jax
 import jax.nn as jnn
@@ -8,7 +8,11 @@ import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
 import equinox as eqx
+from equinox import nn
 from equinox._misc import default_floating_dtype
+
+
+sLSTMState = Tuple[Array, Array, Array, Array]
 
 
 class sLSTMCell(eqx.Module, strict=True):
@@ -88,7 +92,7 @@ class sLSTMCell(eqx.Module, strict=True):
         self.hidden_size = hidden_size
         self.use_bias = use_bias
 
-    def init_state(self):
+    def init_state(self) -> sLSTMState:
         return tuple([
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size)),
@@ -97,7 +101,7 @@ class sLSTMCell(eqx.Module, strict=True):
         ])
 
     @jax.named_scope("sLSTMCell")
-    def __call__(self, input, hidden, *, key=None):
+    def __call__(self, input: Array, hidden: sLSTMState, *, key: PRNGKeyArray=None) -> sLSTMState:
         """**Arguments:**
 
         - `input`: The input, which should be a JAX array of shape `(input_size,)`.
@@ -133,3 +137,90 @@ class sLSTMCell(eqx.Module, strict=True):
         h = o * (c / n)
         
         return (h, c, m, n)
+
+
+class sLSTMBlock(eqx.Module):
+    """A block of scaled Long-Short Term Memory units (sLSTM) with normalization and projection layers.
+
+    !!! example
+
+        This is often used by wrapping it into a `jax.lax.scan`. For example:
+
+        ```python
+        class Model(Module):
+            block: sLSTMBlock
+
+            def __init__(self, ...):
+                self.block = sLSTMBlock(...)
+
+            def __call__(self, xs):
+                scan_fn = lambda state, input: (block(input, state), None)
+                rnn_state = self.block.init_state()
+                final_state, _ = jax.lax.scan(scan_fn, rnn_state, xs)
+                return final_state
+        ```
+    """
+    layer_norm: nn.LayerNorm
+    lstm_cell: sLSTMCell
+    group_norm: nn.GroupNorm
+    upscale_layer: nn.Linear
+    downscale_layer: nn.Linear
+
+    upscale_size: int = eqx.field(static=True)
+    hidden_size: int = eqx.field(static=True)
+    n_heads: int = eqx.field(static=True)
+    projection_factor: float = eqx.field(static=True)
+
+    def __init__(
+            self,
+            hidden_size: int,
+            h2,
+            key: PRNGKeyArray,
+            n_heads: int = 4,
+            projection_factor: float = (4.0 / 3.0),
+        ):
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.projection_factor = projection_factor
+
+        lstm_key, upscale_key, downscale_key = jrandom.split(key, 3)
+
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.lstm_cell = sLSTMCell(hidden_size, hidden_size, n_heads=n_heads, key=lstm_key)
+        self.group_norm = nn.GroupNorm(n_heads, hidden_size)
+
+        self.upscale_size = int(projection_factor * hidden_size)
+        self.upscale_layer = nn.Linear(hidden_size, 2 * self.upscale_size, key=upscale_key)
+        self.downscale_layer = nn.Linear(self.upscale_size, hidden_size, key=downscale_key)
+
+    def init_state(self) -> sLSTMState:
+        """Initializes the hidden state for the sLSTM block.
+
+        **Returns:**
+
+        The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
+        `(n_heads, head_size)`.
+        """
+        return self.lstm_cell.init_state()
+
+    def __call__(self, x: Array, hidden: sLSTMState):
+        """**Arguments:**
+
+        - `x`: The input, which should be a JAX array of shape `(hidden_size,)`.
+        - `hidden`: The hidden state, which should be a 4-tuple of JAX arrays, each of
+            shape `(n_heads, head_size)`.
+
+        **Returns:**
+
+        A tuple containing the updated hidden state and the output of the block.
+        """
+        z = self.layer_norm(x)
+        rnn_state = self.lstm_cell(z, hidden)
+        z = rnn_state[0].reshape(self.hidden_size)
+        z = self.group_norm(z)
+        z = self.upscale_layer(z)
+        upscale_1, upscale_2 = jnp.split(z, 2)
+        upscale_1 = jnn.gelu(upscale_1)
+        z = upscale_1 * upscale_2
+        z = self.downscale_layer(z)
+        return rnn_state, z
