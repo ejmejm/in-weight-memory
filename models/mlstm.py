@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Dict, Union, NamedTuple
 
 import jax
 import jax.nn as jnn
@@ -12,7 +12,8 @@ from equinox import nn
 from equinox._misc import default_floating_dtype
 
 
-mLSTMState = Tuple[Array, Array, Array]
+mLSTMState = NamedTuple('mLSTMState', h=Array, c=Array, n=Array)
+mLSTMBlockState = NamedTuple('mLSTMBlockState', cell_state=mLSTMState, block_state=Array)
 
 
 class mLSTMCell(eqx.Module, strict=True):
@@ -105,11 +106,11 @@ class mLSTMCell(eqx.Module, strict=True):
         self.use_bias = use_bias
 
     def init_state(self):
-        return tuple([
+        return mLSTMState(
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size)),
-        ])
+        )
 
     @jax.named_scope("mLSTMCell")
     def __call__(self, input, hidden, *, v_input=None, key=None):
@@ -130,6 +131,7 @@ class mLSTMCell(eqx.Module, strict=True):
         """
         prev_h, prev_c, prev_n = hidden
 
+        # TODO: Change to jax conditional
         v_input = input if v_input is None else v_input
 
         # Calculate gate values
@@ -166,7 +168,7 @@ class mLSTMCell(eqx.Module, strict=True):
         )[:, None]
         h = o * h
 
-        return h, c, n
+        return mLSTMState(h, c, n)
 
 
 class mLSTMBlock(eqx.Module):
@@ -191,6 +193,7 @@ class mLSTMBlock(eqx.Module):
         ```
     """
     layer_norm: nn.LayerNorm
+    conv: nn.Conv1d
     lstm_cell: mLSTMCell
     group_norm: nn.GroupNorm
     upscale_layer: nn.Linear
@@ -201,8 +204,6 @@ class mLSTMBlock(eqx.Module):
     hidden_size: int = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     projection_factor: float = eqx.field(static=True)
-
-    # Skip connection is an element-wise multiplication with parameters initialized to ones
 
     def __init__(
         self,
@@ -215,20 +216,19 @@ class mLSTMBlock(eqx.Module):
         self.n_heads = n_heads
         self.projection_factor = projection_factor
 
-        lstm_key, upscale_key, downscale_key = jrandom.split(key, 3)
+        upscale_key, lstm_key, conv_key, downscale_key = jrandom.split(key, 4)
 
         self.layer_norm = nn.LayerNorm(hidden_size)
-
         self.upscale_size = int(projection_factor * hidden_size)
         self.upscale_layer = nn.Linear(hidden_size, 2 * self.upscale_size, key=upscale_key)
-
+        self.conv = nn.Conv1d(self.upscale_size, self.upscale_size, 4, groups=self.upscale_size, key=conv_key)
         self.lstm_cell = mLSTMCell(self.upscale_size, self.upscale_size, n_heads=n_heads, key=lstm_key)
         self.group_norm = nn.GroupNorm(n_heads, self.upscale_size)
         self.learnable_skip_params = jnp.ones(self.upscale_size)
 
         self.downscale_layer = nn.Linear(self.upscale_size, hidden_size, key=downscale_key)
 
-    def init_state(self) -> mLSTMState:
+    def init_state(self) -> mLSTMBlockState:
         """Initializes the hidden state for the sLSTM block.
 
         **Returns:**
@@ -236,14 +236,16 @@ class mLSTMBlock(eqx.Module):
         The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
         `(n_heads, head_size)`.
         """
-        return self.lstm_cell.init_state()
+        return mLSTMBlockState(
+            cell_state = self.lstm_cell.init_state(),
+            block_state = jnp.zeros((3, self.upscale_size)),
+        )
 
-    def __call__(self, x: Array, rnn_state: mLSTMState):
+    def __call__(self, x: Array, rnn_state: mLSTMBlockState):
         """**Arguments:**
 
         - `x`: The input, which should be a JAX array of shape `(hidden_size,)`.
-        - `rnn_state`: The rnn state, which should be a 3-tuple of JAX arrays, each of
-            shape `(n_heads, head_size)`.
+        - `rnn_state`: 
 
         **Returns:**
 
@@ -254,11 +256,14 @@ class mLSTMBlock(eqx.Module):
         z, skip_z = jnp.split(z, 2)
 
         # LSTM branch
-        # TODO: Add a convolution layer here
+        z_sequence = jnp.concatenate([rnn_state.block_state, z[None]], axis=0)
+        new_block_state = z_sequence[1:]
+        z = self.conv(z_sequence.T)
+        z = z.squeeze(1)
         qk_input = jnn.swish(z)
         v_input = z
-        rnn_state = self.lstm_cell(qk_input, rnn_state, v_input=v_input)
-        z = rnn_state[0].reshape(self.upscale_size)
+        new_cell_state = self.lstm_cell(qk_input, rnn_state.cell_state, v_input=v_input)
+        z = new_cell_state[0].reshape(self.upscale_size)
         z = self.group_norm(z)
         z = z + qk_input * self.learnable_skip_params
 
@@ -267,4 +272,6 @@ class mLSTMBlock(eqx.Module):
         z = self.downscale_layer(z)
         z = z + x # Final skip connection
 
-        return rnn_state, z
+        new_rnn_state = mLSTMBlockState(new_cell_state, new_block_state)
+
+        return new_rnn_state, z

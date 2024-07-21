@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import jax
 import jax.nn as jnn
@@ -12,7 +12,7 @@ from equinox import nn
 from equinox._misc import default_floating_dtype
 
 
-sLSTMState = Tuple[Array, Array, Array, Array]
+sLSTMState = NamedTuple('sLSTMState', h=Array, c=Array, m=Array, n=Array)
 
 
 class sLSTMCell(eqx.Module, strict=True):
@@ -93,12 +93,12 @@ class sLSTMCell(eqx.Module, strict=True):
         self.use_bias = use_bias
 
     def init_state(self) -> sLSTMState:
-        return tuple([
+        return sLSTMState(
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size)),
-        ])
+        )
 
     @jax.named_scope("sLSTMCell")
     def __call__(self, input: Array, hidden: sLSTMState, *, key: PRNGKeyArray=None) -> sLSTMState:
