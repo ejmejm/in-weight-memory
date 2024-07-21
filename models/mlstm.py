@@ -38,7 +38,8 @@ class mLSTMCell(eqx.Module, strict=True):
     """
     if_weights: Array
     o_weights: Array
-    kvq_weights: Array
+    kq_weights: Array
+    v_weights: Array
     kvq_bias: Optional[Array]
     if_bias: Optional[Array]
     o_bias: Optional[Array]
@@ -47,6 +48,7 @@ class mLSTMCell(eqx.Module, strict=True):
     use_bias: bool = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     head_size: int = eqx.field(static=True)
+    separate_value_input: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -55,6 +57,7 @@ class mLSTMCell(eqx.Module, strict=True):
         use_bias: bool = True,
         n_heads: int = 1,
         dtype = None,
+        separate_value_input: bool = False,
         *,
         key: PRNGKeyArray,
     ):
@@ -67,6 +70,7 @@ class mLSTMCell(eqx.Module, strict=True):
             dtype: The dtype to use for all weights and biases in this LSTM cell.
                 Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending on
                 whether JAX is in 64-bit mode.
+            separate_value_input: Whether to use a separate input for the value layer.
             key: A `jax.random.PRNGKey` used to provide randomness for parameter
                 initialisation. (Keyword only argument.)
         """
@@ -76,15 +80,17 @@ class mLSTMCell(eqx.Module, strict=True):
         self.n_heads = n_heads
 
         dtype = default_floating_dtype() if dtype is None else dtype
-        ih_key, o_key, kvq_key, ihb_key, ob_key, kvqb_key = jrandom.split(key, 6)
+        ih_key, o_key, kv_key, q_key, ihb_key, ob_key, kvqb_key = jrandom.split(key, 7)
         lim = math.sqrt(1 / self.head_size)
 
         self.if_weights = jrandom.uniform(
             ih_key, (n_heads, 2, input_size), minval=-lim, maxval=lim, dtype=dtype)
         self.o_weights = jrandom.uniform(
             o_key, (n_heads, self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
-        self.kvq_weights = jrandom.uniform(
-            kvq_key, (n_heads, 3 * self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
+        self.kq_weights = jrandom.uniform(
+            kv_key, (n_heads, 2 * self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
+        self.v_weights = jrandom.uniform(
+            q_key, (n_heads, self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
 
         if use_bias:
             self.if_bias = jrandom.uniform(
@@ -103,6 +109,7 @@ class mLSTMCell(eqx.Module, strict=True):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.use_bias = use_bias
+        self.separate_value_input = separate_value_input
 
     def init_state(self) -> mLSTMState:
         return mLSTMState(
@@ -113,7 +120,8 @@ class mLSTMCell(eqx.Module, strict=True):
 
     @jax.named_scope("mLSTMCell")
     def __call__(
-        self, input: Array,
+        self,
+        input: Array,
         rnn_state: mLSTMState,
         *,
         v_input: Optional[Array] = None,
@@ -124,7 +132,7 @@ class mLSTMCell(eqx.Module, strict=True):
             input: The input, which should be a JAX array of shape `(input_size,)`.
             rnn_state: A 3-tuple containing the h, c, and n states.
             v_input: The input to the value layer, which should be a JAX array of shape `(hidden_size,)`.
-                If not provided, the input is used as the value input.
+                `separate_value_input` must be set to True on class instantiation for this to take effect.
             key: Ignored; provided for compatibility with the rest of the Equinox API.
                 (Keyword only argument.)
 
@@ -133,9 +141,6 @@ class mLSTMCell(eqx.Module, strict=True):
             `(hidden_size,)`.
         """
         prev_h, prev_c, prev_n = rnn_state
-
-        # TODO: Change to jax conditional
-        v_input = input if v_input is None else v_input
 
         # Calculate gate values
         i_f = jnp.inner(self.if_weights, input)
@@ -150,9 +155,13 @@ class mLSTMCell(eqx.Module, strict=True):
         f = jnp.exp(f)
         o = jnn.sigmoid(o)
 
+        if not self.separate_value_input:
+            v_input = input
+
         # Calculate keys, values, and queries from normalized inputs
-        kvq = self.kvq_weights @ input # TODO: Don't forget to normalize this input in the block
-        k, v, q = jnp.split(kvq, 3, axis=1)
+        kq = self.kq_weights @ input
+        k, q = jnp.split(kq, 2, axis=1)
+        v = self.v_weights @ v_input
         k *= 1.0 / jnp.sqrt(self.head_size)
 
         if self.use_bias:
@@ -224,7 +233,8 @@ class mLSTMBlock(eqx.Module):
         self.upscale_size = int(projection_factor * hidden_size)
         self.upscale_layer = nn.Linear(hidden_size, 2 * self.upscale_size, key=upscale_key)
         self.conv = nn.Conv1d(self.upscale_size, self.upscale_size, 4, groups=self.upscale_size, key=conv_key)
-        self.lstm_cell = mLSTMCell(self.upscale_size, self.upscale_size, n_heads=n_heads, key=lstm_key)
+        self.lstm_cell = mLSTMCell(
+            self.upscale_size, self.upscale_size, n_heads=n_heads, separate_value_input=True, key=lstm_key)
         self.group_norm = nn.GroupNorm(n_heads, self.upscale_size)
         self.learnable_skip_params = jnp.ones(self.upscale_size)
 
