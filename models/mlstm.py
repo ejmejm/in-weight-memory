@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Dict, Union, NamedTuple
+from typing import NamedTuple, Optional, Tuple
 
 import jax
 import jax.nn as jnn
@@ -19,8 +19,7 @@ mLSTMBlockState = NamedTuple('mLSTMBlockState', cell_state=mLSTMState, block_sta
 class mLSTMCell(eqx.Module, strict=True):
     """A single step of a Long-Short Term Memory unit (mLSTM).
 
-    !!! example
-
+    Example:
         This is often used by wrapping it into a `jax.lax.scan`. For example:
 
         ```python
@@ -59,17 +58,17 @@ class mLSTMCell(eqx.Module, strict=True):
         *,
         key: PRNGKeyArray,
     ):
-        """**Arguments:**
-
-        - `input_size`: The dimensionality of the input vector at each time step.
-        - `hidden_size`: The dimensionality of the hidden state passed along between
-            time steps.
-        - `use_bias`: Whether to add on a bias after each update.
-        - `dtype`: The dtype to use for all weights and biases in this LSTM cell.
-            Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending on
-            whether JAX is in 64-bit mode.
-        - `key`: A `jax.random.PRNGKey` used to provide randomness for parameter
-            initialisation. (Keyword only argument.)
+        """
+        Args:
+            input_size: The dimensionality of the input vector at each time step.
+            hidden_size: The dimensionality of the hidden state passed along between
+                time steps.
+            use_bias: Whether to add on a bias after each update.
+            dtype: The dtype to use for all weights and biases in this LSTM cell.
+                Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending on
+                whether JAX is in 64-bit mode.
+            key: A `jax.random.PRNGKey` used to provide randomness for parameter
+                initialisation. (Keyword only argument.)
         """
         assert hidden_size % n_heads == 0, "hidden_size must be divisible by n_heads"
 
@@ -105,7 +104,7 @@ class mLSTMCell(eqx.Module, strict=True):
         self.hidden_size = hidden_size
         self.use_bias = use_bias
 
-    def init_state(self):
+    def init_state(self) -> mLSTMState:
         return mLSTMState(
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size, self.head_size)),
@@ -113,23 +112,27 @@ class mLSTMCell(eqx.Module, strict=True):
         )
 
     @jax.named_scope("mLSTMCell")
-    def __call__(self, input, hidden, *, v_input=None, key=None):
-        """**Arguments:**
-
-        - `input`: The input, which should be a JAX array of shape `(input_size,)`.
-        - `hidden`: The hidden state, which should be a 2-tuple of JAX arrays, each of
-            shape `(hidden_size,)`.
-        - `v_input`: The input to the value layer, which should be a JAX array of shape `(hidden_size,)`.
-            If not provided, the input is used as the value input.
-        - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
-            (Keyword only argument.)
-
-        **Returns:**
-
-        The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
-        `(hidden_size,)`.
+    def __call__(
+        self, input: Array,
+        rnn_state: mLSTMState,
+        *,
+        v_input: Optional[Array] = None,
+        key: Optional[PRNGKeyArray] = None,
+    ) -> Tuple[mLSTMState, Array]:
         """
-        prev_h, prev_c, prev_n = hidden
+        Args:
+            input: The input, which should be a JAX array of shape `(input_size,)`.
+            rnn_state: A 3-tuple containing the h, c, and n states.
+            v_input: The input to the value layer, which should be a JAX array of shape `(hidden_size,)`.
+                If not provided, the input is used as the value input.
+            key: Ignored; provided for compatibility with the rest of the Equinox API.
+                (Keyword only argument.)
+
+        Returns:
+            The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
+            `(hidden_size,)`.
+        """
+        prev_h, prev_c, prev_n = rnn_state
 
         # TODO: Change to jax conditional
         v_input = input if v_input is None else v_input
@@ -168,14 +171,13 @@ class mLSTMCell(eqx.Module, strict=True):
         )[:, None]
         h = o * h
 
-        return mLSTMState(h, c, n)
+        return mLSTMState(h, c, n), h.reshape(self.hidden_size)
 
 
 class mLSTMBlock(eqx.Module):
     """A block of scaled Long-Short Term Memory units (mLSTM) with normalization and projection layers.
 
-    !!! example
-
+    Example:
         This is often used by wrapping it into a `jax.lax.scan`. For example:
 
         ```python
@@ -229,27 +231,27 @@ class mLSTMBlock(eqx.Module):
         self.downscale_layer = nn.Linear(self.upscale_size, hidden_size, key=downscale_key)
 
     def init_state(self) -> mLSTMBlockState:
-        """Initializes the hidden state for the sLSTM block.
+        """
+        Initializes the hidden state for the sLSTM block.
 
-        **Returns:**
-
-        The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
-        `(n_heads, head_size)`.
+        Returns:
+            The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
+            `(n_heads, head_size)`.
         """
         return mLSTMBlockState(
             cell_state = self.lstm_cell.init_state(),
             block_state = jnp.zeros((3, self.upscale_size)),
         )
 
-    def __call__(self, x: Array, rnn_state: mLSTMBlockState):
-        """**Arguments:**
+    @jax.named_scope("mLSTMBlock")
+    def __call__(self, x: Array, rnn_state: mLSTMBlockState) -> Tuple[mLSTMBlockState, Array]:
+        """
+        Args:
+            x: The input, which should be a JAX array of shape `(hidden_size,)`.
+            rnn_state: The current state of the RNN.
 
-        - `x`: The input, which should be a JAX array of shape `(hidden_size,)`.
-        - `rnn_state`: 
-
-        **Returns:**
-
-        A tuple containing the updated hidden state and the output of the block.
+        Returns:
+            A tuple containing the updated hidden state and the output of the block.
         """
         z = self.layer_norm(x)
         z = self.upscale_layer(z)
@@ -262,8 +264,7 @@ class mLSTMBlock(eqx.Module):
         z = z.squeeze(1)
         qk_input = jnn.swish(z)
         v_input = z
-        new_cell_state = self.lstm_cell(qk_input, rnn_state.cell_state, v_input=v_input)
-        z = new_cell_state[0].reshape(self.upscale_size)
+        new_cell_state, z = self.lstm_cell(qk_input, rnn_state.cell_state, v_input=v_input)
         z = self.group_norm(z)
         z = z + qk_input * self.learnable_skip_params
 

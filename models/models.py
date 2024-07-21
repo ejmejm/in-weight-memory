@@ -7,11 +7,12 @@ import jax
 from jax import Array
 import jax.numpy as jnp
 
-from .slstm import sLSTMBlock, sLSTMCell
-from .mlstm import mLSTMBlock, mLSTMCell
+from .slstm import sLSTMBlock, sLSTMCell, sLSTMState
+from .mlstm import mLSTMBlock, mLSTMCell, mLSTMState, mLSTMBlockState
 
 
-LSTMState = Tuple[Tuple[Array]]
+LSTMState = Tuple[Union[Tuple[Array, Array], sLSTMState, mLSTMState, mLSTMBlockState]]
+
 LSTM_CLS = mLSTMBlock
 
 
@@ -93,11 +94,13 @@ class SupervisedModel(eqx.Module):
 
             if i in self.recurrent_layer_indices:
                 rnn_state_i = rnn_state[recurrent_layer_idx]
-                if LSTM_CLS in (sLSTMBlock, mLSTMBlock):
-                    out_rnn_state, z = layer(z, rnn_state_i)
-                else:
+
+                if LSTM_CLS == nn.LSTMCell:
                     out_rnn_state = layer(z, rnn_state_i)
                     z = out_rnn_state[0].flatten()
+                else:
+                    out_rnn_state, z = layer(z, rnn_state_i)
+
                 new_rnn_state.append(out_rnn_state)
                 recurrent_layer_idx += 1
             else:
