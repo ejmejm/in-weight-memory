@@ -174,7 +174,6 @@ class sLSTMBlock(eqx.Module):
     def __init__(
             self,
             hidden_size: int,
-            h2,
             key: PRNGKeyArray,
             n_heads: int = 4,
             projection_factor: float = (4.0 / 3.0),
@@ -203,11 +202,11 @@ class sLSTMBlock(eqx.Module):
         """
         return self.lstm_cell.init_state()
 
-    def __call__(self, x: Array, hidden: sLSTMState):
+    def __call__(self, x: Array, rnn_state: sLSTMState):
         """**Arguments:**
 
         - `x`: The input, which should be a JAX array of shape `(hidden_size,)`.
-        - `hidden`: The hidden state, which should be a 4-tuple of JAX arrays, each of
+        - `rnn_state`: The rnn state, which should be a 4-tuple of JAX arrays, each of
             shape `(n_heads, head_size)`.
 
         **Returns:**
@@ -215,7 +214,7 @@ class sLSTMBlock(eqx.Module):
         A tuple containing the updated hidden state and the output of the block.
         """
         z = self.layer_norm(x)
-        rnn_state = self.lstm_cell(z, hidden)
+        rnn_state = self.lstm_cell(z, rnn_state)
         z = rnn_state[0].reshape(self.hidden_size)
         z = self.group_norm(z)
         z = self.upscale_layer(z)

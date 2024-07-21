@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import jax
 import jax.nn as jnn
@@ -8,7 +8,11 @@ import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
 import equinox as eqx
+from equinox import nn
 from equinox._misc import default_floating_dtype
+
+
+mLSTMState = Tuple[Array, Array, Array]
 
 
 class mLSTMCell(eqx.Module, strict=True):
@@ -108,12 +112,14 @@ class mLSTMCell(eqx.Module, strict=True):
         ])
 
     @jax.named_scope("mLSTMCell")
-    def __call__(self, input, hidden, *, key=None):
+    def __call__(self, input, hidden, *, v_input=None, key=None):
         """**Arguments:**
 
         - `input`: The input, which should be a JAX array of shape `(input_size,)`.
         - `hidden`: The hidden state, which should be a 2-tuple of JAX arrays, each of
             shape `(hidden_size,)`.
+        - `v_input`: The input to the value layer, which should be a JAX array of shape `(hidden_size,)`.
+            If not provided, the input is used as the value input.
         - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
             (Keyword only argument.)
 
@@ -123,6 +129,8 @@ class mLSTMCell(eqx.Module, strict=True):
         `(hidden_size,)`.
         """
         prev_h, prev_c, prev_n = hidden
+
+        v_input = input if v_input is None else v_input
 
         # Calculate gate values
         i_f = jnp.inner(self.if_weights, input)
@@ -159,3 +167,104 @@ class mLSTMCell(eqx.Module, strict=True):
         h = o * h
 
         return h, c, n
+
+
+class mLSTMBlock(eqx.Module):
+    """A block of scaled Long-Short Term Memory units (mLSTM) with normalization and projection layers.
+
+    !!! example
+
+        This is often used by wrapping it into a `jax.lax.scan`. For example:
+
+        ```python
+        class Model(Module):
+            block: mLSTMBlock
+
+            def __init__(self, ...):
+                self.block = mLSTMBlock(...)
+
+            def __call__(self, xs):
+                scan_fn = lambda state, input: (block(input, state), None)
+                rnn_state = self.block.init_state()
+                final_state, _ = jax.lax.scan(scan_fn, rnn_state, xs)
+                return final_state
+        ```
+    """
+    layer_norm: nn.LayerNorm
+    lstm_cell: mLSTMCell
+    group_norm: nn.GroupNorm
+    upscale_layer: nn.Linear
+    downscale_layer: nn.Linear
+    learnable_skip_params: Array
+
+    upscale_size: int = eqx.field(static=True)
+    hidden_size: int = eqx.field(static=True)
+    n_heads: int = eqx.field(static=True)
+    projection_factor: float = eqx.field(static=True)
+
+    # Skip connection is an element-wise multiplication with parameters initialized to ones
+
+    def __init__(
+        self,
+        hidden_size: int,
+        key: PRNGKeyArray,
+        n_heads: int = 4,
+        projection_factor: float = 2.0,
+    ):
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.projection_factor = projection_factor
+
+        lstm_key, upscale_key, downscale_key = jrandom.split(key, 3)
+
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+        self.upscale_size = int(projection_factor * hidden_size)
+        self.upscale_layer = nn.Linear(hidden_size, 2 * self.upscale_size, key=upscale_key)
+
+        self.lstm_cell = mLSTMCell(self.upscale_size, self.upscale_size, n_heads=n_heads, key=lstm_key)
+        self.group_norm = nn.GroupNorm(n_heads, self.upscale_size)
+        self.learnable_skip_params = jnp.ones(self.upscale_size)
+
+        self.downscale_layer = nn.Linear(self.upscale_size, hidden_size, key=downscale_key)
+
+    def init_state(self) -> mLSTMState:
+        """Initializes the hidden state for the sLSTM block.
+
+        **Returns:**
+
+        The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
+        `(n_heads, head_size)`.
+        """
+        return self.lstm_cell.init_state()
+
+    def __call__(self, x: Array, rnn_state: mLSTMState):
+        """**Arguments:**
+
+        - `x`: The input, which should be a JAX array of shape `(hidden_size,)`.
+        - `rnn_state`: The rnn state, which should be a 3-tuple of JAX arrays, each of
+            shape `(n_heads, head_size)`.
+
+        **Returns:**
+
+        A tuple containing the updated hidden state and the output of the block.
+        """
+        z = self.layer_norm(x)
+        z = self.upscale_layer(z)
+        z, skip_z = jnp.split(z, 2)
+
+        # LSTM branch
+        # TODO: Add a convolution layer here
+        qk_input = jnn.swish(z)
+        v_input = z
+        rnn_state = self.lstm_cell(qk_input, rnn_state, v_input=v_input)
+        z = rnn_state[0].reshape(self.upscale_size)
+        z = self.group_norm(z)
+        z = z + qk_input * self.learnable_skip_params
+
+        # Branches converge
+        z = z * jnn.swish(skip_z)
+        z = self.downscale_layer(z)
+        z = z + x # Final skip connection
+
+        return rnn_state, z

@@ -8,11 +8,11 @@ from jax import Array
 import jax.numpy as jnp
 
 from .slstm import sLSTMBlock, sLSTMCell
-from .mlstm import mLSTMCell
+from .mlstm import mLSTMBlock, mLSTMCell
 
 
 LSTMState = Tuple[Tuple[Array]]
-LSTM_CLS = sLSTMBlock # nn.LSTMCell
+LSTM_CLS = nn.LSTMCell
 
 
 class SupervisedModel(eqx.Module):
@@ -57,7 +57,12 @@ class SupervisedModel(eqx.Module):
             if self.layer_sizes[i] < 0:
                 self.layers.append(nn.Identity())
             elif i - 1 in self.recurrent_layer_indices:
-                self.layers.append(LSTM_CLS(self.layer_sizes[i-1], self.layer_sizes[i], key=gen_keys[i]))
+                if LSTM_CLS in (mLSTMBlock, sLSTMBlock):
+                    assert self.layer_sizes[i-1] == self.layer_sizes[i], \
+                        "mLSTM and sLSTM blocks require the same dimensionality for the input and output layers."
+                    self.layers.append(LSTM_CLS(self.layer_sizes[i], key=gen_keys[i]))
+                else:
+                    self.layers.append(LSTM_CLS(self.layer_sizes[i-1], self.layer_sizes[i], key=gen_keys[i]))
             else:
                 self.layers.append(nn.Linear(self.layer_sizes[i-1], self.layer_sizes[i], key=gen_keys[i]))
 
@@ -88,7 +93,7 @@ class SupervisedModel(eqx.Module):
 
             if i in self.recurrent_layer_indices:
                 rnn_state_i = rnn_state[recurrent_layer_idx]
-                if LSTM_CLS == sLSTMBlock:
+                if LSTM_CLS in (sLSTMBlock, mLSTMBlock):
                     out_rnn_state, z = layer(z, rnn_state_i)
                 else:
                     out_rnn_state = layer(z, rnn_state_i)
