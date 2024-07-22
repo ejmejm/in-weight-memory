@@ -123,8 +123,8 @@ class mLSTMCell(eqx.Module, strict=True):
         self,
         input: Array,
         rnn_state: mLSTMState,
-        *,
         v_input: Optional[Array] = None,
+        *,
         key: Optional[PRNGKeyArray] = None,
     ) -> Tuple[mLSTMState, Array]:
         """
@@ -219,9 +219,10 @@ class mLSTMBlock(eqx.Module):
     def __init__(
         self,
         hidden_size: int,
-        key: PRNGKeyArray,
         n_heads: int = 4,
         projection_factor: float = 2.0,
+        *,
+        key: PRNGKeyArray,
     ):
         self.hidden_size = hidden_size
         self.n_heads = n_heads
@@ -254,11 +255,19 @@ class mLSTMBlock(eqx.Module):
         )
 
     @jax.named_scope("mLSTMBlock")
-    def __call__(self, x: Array, rnn_state: mLSTMBlockState) -> Tuple[mLSTMBlockState, Array]:
+    def __call__(
+        self,
+        x: Array,
+        rnn_state: mLSTMBlockState,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+    ) -> Tuple[mLSTMBlockState, Array]:
         """
         Args:
             x: The input, which should be a JAX array of shape `(hidden_size,)`.
             rnn_state: The current state of the RNN.
+            key: Ignored; provided for compatibility with the rest of the Equinox API.
+                (Keyword only argument.)
 
         Returns:
             A tuple containing the updated hidden state and the output of the block.

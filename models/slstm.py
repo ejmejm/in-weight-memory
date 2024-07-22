@@ -205,10 +205,11 @@ class sLSTMBlock(eqx.Module):
     def __init__(
             self,
             hidden_size: int,
-            key: PRNGKeyArray,
             n_heads: int = 4,
             projection_factor: float = (4.0 / 3.0),
             use_conv: bool = True,
+            *,
+            key: PRNGKeyArray,
         ):
         self.hidden_size = hidden_size
         self.n_heads = n_heads
@@ -246,12 +247,20 @@ class sLSTMBlock(eqx.Module):
         )
 
     @jax.named_scope("sLSTMBlock")
-    def __call__(self, x: Array, rnn_state: sLSTMBlockState) -> Tuple[sLSTMBlockState, Array]:
+    def __call__(
+        self,
+        x: Array,
+        rnn_state: sLSTMBlockState,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+    ) -> Tuple[sLSTMBlockState, Array]:
         """
         Args:
             x: The input, which should be a JAX array of shape `(hidden_size,)`.
             rnn_state: The rnn state, which should be a 4-tuple of JAX arrays, each of
                 shape `(n_heads, head_size)`.
+            key: Ignored; provided for compatibility with the rest of the Equinox API.
+                (Keyword only argument.)
 
         Returns:
             A tuple containing the updated hidden state and the output of the block.
