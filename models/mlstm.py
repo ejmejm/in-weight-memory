@@ -245,8 +245,8 @@ class mLSTMBlock(eqx.Module):
         Initializes the hidden state for the sLSTM block.
 
         Returns:
-            The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
-            `(n_heads, head_size)`.
+            The initial hidden state, which is a the cell state and a 3-tuple of JAX arrays,
+            each of shape `(n_heads, head_size)`.
         """
         return mLSTMBlockState(
             cell_state = self.lstm_cell.init_state(),

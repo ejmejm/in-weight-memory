@@ -13,6 +13,7 @@ from equinox._misc import default_floating_dtype
 
 
 sLSTMState = NamedTuple('sLSTMState', h=Array, c=Array, m=Array, n=Array)
+sLSTMBlockState = NamedTuple('sLSTMBlockState', cell_state=sLSTMState, block_state=Array)
 
 
 class sLSTMCell(eqx.Module, strict=True):
@@ -36,7 +37,8 @@ class sLSTMCell(eqx.Module, strict=True):
         ```
 
     """
-    weight_ih: Array
+    weight_if: Array
+    weight_zo: Array
     weight_hh: Array
     bias: Optional[Array]
     input_size: int = eqx.field(static=True)
@@ -44,6 +46,7 @@ class sLSTMCell(eqx.Module, strict=True):
     use_bias: bool = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     head_size: int = eqx.field(static=True)
+    separate_zo_input: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -52,6 +55,7 @@ class sLSTMCell(eqx.Module, strict=True):
         use_bias: bool = True,
         n_heads: int = 1,
         dtype = None,
+        separate_zo_input: bool = False,
         *,
         key: PRNGKeyArray,
     ):
@@ -64,6 +68,7 @@ class sLSTMCell(eqx.Module, strict=True):
             dtype: The dtype to use for all weights and biases in this LSTM cell.
                 Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending on
                 whether JAX is in 64-bit mode.
+            separate_zo_input: Whether to use a different input for the cell (z) and output (o) gates.
             key: A `jax.random.PRNGKey` used to provide randomness for parameter
                 initialisation. (Keyword only argument.)
         """
@@ -76,8 +81,10 @@ class sLSTMCell(eqx.Module, strict=True):
         lim = math.sqrt(1 / self.head_size)
         self.n_heads = n_heads
 
-        self.weight_ih = jrandom.uniform(
-            ihkey, (n_heads, 4 * self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
+        self.weight_if = jrandom.uniform(
+            ihkey, (n_heads, 2 * self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
+        self.weight_zo = jrandom.uniform(
+            ihkey, (n_heads, 2 * self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
         self.weight_hh = jrandom.uniform(
             # TODO: Add support for multiple heads
             hhkey, (n_heads, 4 * self.head_size, self.head_size), minval=-lim, maxval=lim, dtype=dtype)
@@ -91,6 +98,7 @@ class sLSTMCell(eqx.Module, strict=True):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.use_bias = use_bias
+        self.separate_zo_input = separate_zo_input
 
     def init_state(self) -> sLSTMState:
         return sLSTMState(
@@ -106,7 +114,8 @@ class sLSTMCell(eqx.Module, strict=True):
         input: Array,
         rnn_state: sLSTMState,
         *,
-        key: PRNGKeyArray=None,
+        zo_input: Optional[Array] = None,
+        key: PRNGKeyArray = None,
     ) -> Tuple[sLSTMState, Array]:
         """
         Args:
@@ -122,8 +131,15 @@ class sLSTMCell(eqx.Module, strict=True):
         """
         prev_h, prev_c, prev_m, prev_n = rnn_state
 
+        if not self.separate_zo_input:
+            zo_input = input
+
+        if_linear = self.weight_if @ input
+        zo_linear = self.weight_zo @ zo_input
+        combined_linear = jnp.concatenate([if_linear, zo_linear], axis=1)
+
         # (n_heads, 4 * head_size)
-        lin = self.weight_ih @ input + (self.weight_hh @ prev_h[..., None]).squeeze(2)
+        lin = combined_linear + (self.weight_hh @ prev_h[..., None]).squeeze(2)
 
         if self.use_bias:
             lin = lin + self.bias
@@ -174,6 +190,7 @@ class sLSTMBlock(eqx.Module):
         A block of scaled Long-Short Term Memory units (sLSTM) with normalization and projection layers.
     """
     layer_norm: nn.LayerNorm
+    conv: Optional[nn.Conv1d]
     lstm_cell: sLSTMCell
     group_norm: nn.GroupNorm
     upscale_layer: nn.Linear
@@ -183,6 +200,7 @@ class sLSTMBlock(eqx.Module):
     hidden_size: int = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     projection_factor: float = eqx.field(static=True)
+    use_conv: bool = eqx.field(static=True)
 
     def __init__(
             self,
@@ -190,33 +208,45 @@ class sLSTMBlock(eqx.Module):
             key: PRNGKeyArray,
             n_heads: int = 4,
             projection_factor: float = (4.0 / 3.0),
+            use_conv: bool = True,
         ):
         self.hidden_size = hidden_size
         self.n_heads = n_heads
         self.projection_factor = projection_factor
+        self.use_conv = use_conv
 
-        lstm_key, upscale_key, downscale_key = jrandom.split(key, 3)
+        lstm_key, upscale_key, downscale_key, conv_key = jrandom.split(key, 4)
 
         self.layer_norm = nn.LayerNorm(hidden_size)
-        self.lstm_cell = sLSTMCell(hidden_size, hidden_size, n_heads=n_heads, key=lstm_key)
+        self.lstm_cell = sLSTMCell(
+            hidden_size, hidden_size, n_heads=n_heads, separate_zo_input=use_conv, key=lstm_key)
         self.group_norm = nn.GroupNorm(n_heads, hidden_size)
 
         self.upscale_size = int(projection_factor * hidden_size)
         self.upscale_layer = nn.Linear(hidden_size, 2 * self.upscale_size, key=upscale_key)
         self.downscale_layer = nn.Linear(self.upscale_size, hidden_size, key=downscale_key)
 
-    def init_state(self) -> sLSTMState:
+        if use_conv:
+            self.conv = nn.Conv1d(
+                self.hidden_size, self.hidden_size, 4, groups=self.hidden_size, key=conv_key)
+        else:
+            self.conv = None
+
+    def init_state(self) -> sLSTMBlockState:
         """
-        Initializes the hidden state for the sLSTM block.
+        Initializes the hidden state for the mLSTM block.
 
         Returns:
-            The initial hidden state, which is a 4-tuple of JAX arrays, each of shape
-            `(n_heads, head_size)`.
+            The initial hidden state, which is the cell state and a 3-tuple of JAX arrays,
+            each of shape `(n_heads, head_size)`.
         """
-        return self.lstm_cell.init_state()
+        return sLSTMBlockState(
+            cell_state = self.lstm_cell.init_state(),
+            block_state = jnp.zeros((3, self.hidden_size)),
+        )
 
     @jax.named_scope("sLSTMBlock")
-    def __call__(self, x: Array, rnn_state: sLSTMState) -> Tuple[sLSTMState, Array]:
+    def __call__(self, x: Array, rnn_state: sLSTMBlockState) -> Tuple[sLSTMBlockState, Array]:
         """
         Args:
             x: The input, which should be a JAX array of shape `(hidden_size,)`.
@@ -226,12 +256,30 @@ class sLSTMBlock(eqx.Module):
         Returns:
             A tuple containing the updated hidden state and the output of the block.
         """
-        z = self.layer_norm(x)
-        rnn_state, z = self.lstm_cell(z, rnn_state)
+        x_normalized = self.layer_norm(x)
+
+        if self.use_conv:
+            z_sequence = jnp.concatenate([rnn_state.block_state, x_normalized[None]], axis=0)
+            new_block_state = z_sequence[1:]
+            z = self.conv(z_sequence.T)
+            z = z.squeeze(1)
+
+            if_input = jnn.swish(z)
+            zo_input = x_normalized
+
+            new_cell_state, z = self.lstm_cell(if_input, rnn_state.cell_state, zo_input=zo_input)
+        else:
+            new_block_state = rnn_state.block_state
+            new_cell_state, z = self.lstm_cell(x_normalized, rnn_state.cell_state)
+
         z = self.group_norm(z)
         z = self.upscale_layer(z)
         upscale_1, upscale_2 = jnp.split(z, 2)
         upscale_1 = jnn.gelu(upscale_1)
-        z = upscale_1 * upscale_2
+        z = upscale_1 * upscale_2 # Self gating
         z = self.downscale_layer(z)
-        return rnn_state, z
+        z += x # Skip connection
+
+        new_rnn_state = sLSTMBlockState(new_cell_state, new_block_state)
+
+        return new_rnn_state, z

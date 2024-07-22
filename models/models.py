@@ -12,8 +12,7 @@ from .mlstm import mLSTMBlock, mLSTMCell, mLSTMState, mLSTMBlockState
 
 
 LSTMState = Tuple[Union[Tuple[Array, Array], sLSTMState, mLSTMState, mLSTMBlockState]]
-
-LSTM_CLS = mLSTMBlock
+LSTM_CLS = sLSTMBlock
 
 
 class SupervisedModel(eqx.Module):
