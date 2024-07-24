@@ -251,7 +251,7 @@ def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
             state.name_length - 1 <= state.curr_sequence_idx,
             state.curr_sequence_idx < state.name_length + state.val_length - 1,
         ),
-        1, 0,
+        1.0, 0.0,
     ) * state.seen_before
 
     return state, {

@@ -20,7 +20,11 @@ from training import apply_grads, supervised_loss_and_grads, TrainState
 # jax.config.update("jax_debug_nans", True)
 
 
-def create_model(rng: PRNGKeyArray, model_config: DictConfig) -> eqx.Module:
+def create_model(
+        rng: PRNGKeyArray,
+        model_config: DictConfig,
+        half_precision: bool = False,
+    ) -> eqx.Module:
     model = xLSTM(
         vocab_size = model_config.vocab_size,
         hidden_dim = model_config.hidden_dim,
@@ -32,6 +36,10 @@ def create_model(rng: PRNGKeyArray, model_config: DictConfig) -> eqx.Module:
         penultimate_norm = model_config.penultimate_norm,
         key = rng,
     )
+
+    if half_precision:
+        model = jax.tree.map(lambda x: x.astype(jnp.bfloat16), model)
+
     return model
 
 
@@ -55,11 +63,14 @@ def batch_train_iter(
         model: eqx.Module,
         env_step_fn: Callable,
         train_config: DictConfig,
+        half_precision: bool = False,
     ):
     # Generate `tbptt_window` long sequences for each env state in the batch
     batch_env_step_fn = jax.vmap((lambda state, _: env_step_fn(state)), in_axes=(0, None))
     env_states, train_sequences = jax.lax.scan(batch_env_step_fn, env_states, length=train_config.tbptt_window)
     train_sequences = jax.tree.map(jnp.transpose, train_sequences)
+    if half_precision:
+        train_sequences['loss_mask'] = train_sequences['loss_mask'].astype(jnp.bfloat16)
     
     batch_loss_and_grads = jax.vmap(supervised_loss_and_grads, (None, 0, 0))
     losses, grads, rnn_states = batch_loss_and_grads(model, rnn_states, train_sequences)
@@ -75,7 +86,7 @@ def batch_train_iter(
     return train_state, env_states, rnn_states, model, loss
 
 
-@partial(jax.jit, static_argnums=(4, 5, 6))
+@partial(jax.jit, static_argnums=(4, 5, 6, 7))
 def train_loop(
         train_state: TrainState,
         env_states: ContinualARState,
@@ -84,11 +95,12 @@ def train_loop(
         env_step_fn: Callable,
         train_config: DictConfig,
         train_steps: int,
+        half_precision: bool = False,
     ):
     def train_step(carry, _):
         train_state, env_states, rnn_states, model = carry
         train_state, env_states, rnn_states, model, loss = batch_train_iter(
-            train_state, env_states, rnn_states, model, env_step_fn, train_config)
+            train_state, env_states, rnn_states, model, env_step_fn, train_config, half_precision)
         return (train_state, env_states, rnn_states, model), loss
 
     (train_state, env_states, rnn_states, model), losses = jax.lax.scan(
@@ -103,6 +115,7 @@ def train(
         model: eqx.Module,
         env_step_fn: Callable,
         train_config: DictConfig,
+        half_precision: bool = False,
     ):
     steps_per_log = train_config.log_interval // (train_config.tbptt_window * train_config.batch_size)
     total_steps = train_config.steps // (train_config.tbptt_window * train_config.batch_size)
@@ -113,10 +126,12 @@ def train(
     with tqdm(total=train_config.steps) as pbar:
         for _ in range(total_steps // steps_per_log):
             train_state, env_states, rnn_states, model, losses = train_loop(
-                train_state, env_states, rnn_states, model, env_step_fn, train_config, steps_per_log)
+                train_state, env_states, rnn_states, model, env_step_fn,
+                train_config, steps_per_log, half_precision,
+            )
             avg_loss = jnp.nanmean(losses)
-            # if jnp.isnan(avg_loss):
-            #     print('Loss is nan, breakpoint!')
+            if jnp.isnan(avg_loss):
+                print('Loss is nan, breakpoint!')
             train_steps_passed += steps_per_log
             env_steps_passed += steps_per_log * train_config.tbptt_window * train_config.batch_size
             pbar.update(steps_per_log * train_config.tbptt_window * train_config.batch_size)
@@ -135,9 +150,12 @@ def main(config: DictConfig) -> None:
     model_key, env_key, rng = jax.random.split(rng, 3)
 
     # Prepare model
-    model = create_model(model_key, config.model)
+    model = create_model(model_key, config.model, config.half_precision)
     rnn_states = jax.vmap(lambda _: model.init_rnn_state())(jnp.arange(config.train.batch_size))
-    print('# Model params:', sum(jax.tree_leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
+    if config.half_precision:
+        rnn_states = jax.tree.map(lambda x: x.astype(jnp.bfloat16), rnn_states)
+
+    print('# Model params:', sum(jax.tree.leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
 
     # Prepare optimizer
     optimizer, opt_state = create_optimizer(model, config.optimizer)
@@ -149,7 +167,10 @@ def main(config: DictConfig) -> None:
 
     # Train
     train_state = TrainState(rng, opt_state, optimizer.update)
-    train(train_state, env_states, rnn_states, model, env_step_fn, config.train)
+    train(
+        train_state, env_states, rnn_states, model, env_step_fn,
+        config.train, config.half_precision,
+    )
 
 
 if __name__ == '__main__':

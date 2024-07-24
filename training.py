@@ -42,7 +42,7 @@ def supervised_loss_and_grads(
         rnn_state, pred_ids = model.forward_sequence(rnn_state, input_tokens)
         loss = optax.softmax_cross_entropy_with_integer_labels(pred_ids, target_tokens) * loss_mask
         n_targets = jnp.sum(loss_mask)
-        loss = jax.lax.cond(n_targets > 0, lambda x: jnp.sum(x), lambda _: 0.0, loss)
+        loss = jax.lax.cond(n_targets > 0, lambda x: jnp.sum(x), lambda _: jnp.array(0.0, dtype=loss.dtype), loss)
         return loss, (n_targets, rnn_state)
     
     value_grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
