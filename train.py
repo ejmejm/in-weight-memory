@@ -1,70 +1,70 @@
+from functools import partial
+import math
+import time
+from typing import Callable, Tuple
+
 import equinox as eqx
+import hydra
 import jax
 import jax.numpy as jnp
+from jaxtyping import PRNGKeyArray
+from omegaconf import DictConfig
 import optax
+from tqdm import tqdm
 
-from models import SupervisedModel
-from tasks import gen_train_sequence
+from models.xlstm import xLSTM, xLSTMState
+from tasks import ContinualARState, next_associative_recall_obs
 from training import apply_grads, supervised_loss_and_grads, TrainState
-from utils import tree_replace
 
 
-NAME_VOCAB_SIZE = 26
-VAL_VOCAB_SIZE = 10
-VOCAB_SIZE = NAME_VOCAB_SIZE + VAL_VOCAB_SIZE + 3
+# jax.config.update("jax_debug_nans", True)
 
 
-def train_loop(train_state, model, tbptt_window, iters=50):
-    rngs = jax.random.split(train_state.rng, iters + 1)
-    train_state = tree_replace(train_state, rng=rngs[0])
-        
-    gen_sequences = jax.vmap(gen_train_sequence, (0, None, None, None, None, None))
-
-    seq_rngs = jnp.array([jax.random.PRNGKey(0) for _ in range(iters)])
-    train_sequences = gen_sequences(
-        rngs[1:],
-        # seq_rngs,
-        2, 2, 3, NAME_VOCAB_SIZE, VAL_VOCAB_SIZE)
-
-    def train_iter(loop_state, train_sequence):
-        train_state, model = loop_state
-        loss, grads, _ = supervised_loss_and_grads(
-            model,
-            model.init_rnn_state(),
-            train_sequence,
-            tbptt_window,
-        )
-        train_state, new_model = apply_grads(
-            train_state,
-            model,
-            grads,
-        )
-        return (train_state, new_model), loss
-
-    (train_state, new_model), losses = jax.lax.scan(train_iter, (train_state, model), train_sequences)
-
-    return train_state, new_model, losses
-
-
-def batch_train_iter(train_state, model, tbptt_window, batch_size):
-    rngs = jax.random.split(train_state.rng, batch_size + 1)
-    train_state = tree_replace(train_state, rng=rngs[0])
-        
-    gen_sequences = jax.vmap(gen_train_sequence, (0, None, None, None, None, None))
-    train_sequences = gen_sequences(
-        rngs[1:], 2, 2, 3, NAME_VOCAB_SIZE, VAL_VOCAB_SIZE)
-    
-    v_loss_and_grads = jax.vmap(supervised_loss_and_grads, (None, None, 0, None))
-
-    losses, grads, _ = v_loss_and_grads(
-        model,
-        model.init_rnn_state(),
-        train_sequences,
-        tbptt_window,
+def create_model(rng: PRNGKeyArray, model_config: DictConfig) -> eqx.Module:
+    model = xLSTM(
+        vocab_size = model_config.vocab_size,
+        hidden_dim = model_config.hidden_dim,
+        n_blocks = model_config.n_blocks,
+        n_heads = model_config.n_heads,
+        ms_ratio = model_config.ms_ratio,
+        mlstm_kwargs = model_config.get('mlstm_kwargs', None),
+        slstm_kwargs = model_config.get('slstm_kwargs', None),
+        penultimate_norm = model_config.penultimate_norm,
+        key = rng,
     )
+    return model
+
+
+def create_optimizer(
+    model: eqx.Module, optimizer_config: DictConfig,
+) -> Tuple[optax.GradientTransformation, optax.OptState]:
+    optimizer = optax.adam(optimizer_config.learning_rate)
+    opt_state = optimizer.init(model)
+    return optimizer, opt_state
+
+
+def init_environment(rng: PRNGKeyArray, env_config: DictConfig) -> Tuple[ContinualARState, Callable]:
+    state = ContinualARState(rng = rng, **env_config)
+    return state
+
+
+def batch_train_iter(
+        train_state: TrainState,
+        env_states: ContinualARState,
+        rnn_states: xLSTMState,
+        model: eqx.Module,
+        env_step_fn: Callable,
+        train_config: DictConfig,
+    ):
+    # Generate `tbptt_window` long sequences for each env state in the batch
+    batch_env_step_fn = jax.vmap((lambda state, _: env_step_fn(state)), in_axes=(0, None))
+    env_states, train_sequences = jax.lax.scan(batch_env_step_fn, env_states, length=train_config.tbptt_window)
+    train_sequences = jax.tree.map(jnp.transpose, train_sequences)
+    
+    batch_loss_and_grads = jax.vmap(supervised_loss_and_grads, (None, 0, 0))
+    losses, grads, rnn_states = batch_loss_and_grads(model, rnn_states, train_sequences)
     loss = jnp.mean(losses)
-    # Average over gradients (which are each a pytree)
-    grads = jax.tree.map(lambda x: jnp.mean(x, axis=0), grads)
+    grads = jax.tree.map(lambda x: jnp.mean(x, axis=0), grads) # Average over gradients
     
     train_state, model = apply_grads(
         train_state,
@@ -72,64 +72,85 @@ def batch_train_iter(train_state, model, tbptt_window, batch_size):
         grads,
     )
 
-    return train_state, model, loss
+    return train_state, env_states, rnn_states, model, loss
 
 
-def batch_train_loop(train_state, model, tbptt_window, batch_size, n_steps):
-    def scannable_update(state, _):
-        train_state, model = state
-        train_state, model, loss = batch_train_iter(train_state, model, tbptt_window, batch_size)
-        return (train_state, model), loss
+@partial(jax.jit, static_argnums=(4, 5, 6))
+def train_loop(
+        train_state: TrainState,
+        env_states: ContinualARState,
+        rnn_states: xLSTMState,
+        model: eqx.Module,
+        env_step_fn: Callable,
+        train_config: DictConfig,
+        train_steps: int,
+    ):
+    def train_step(carry, _):
+        train_state, env_states, rnn_states, model = carry
+        train_state, env_states, rnn_states, model, loss = batch_train_iter(
+            train_state, env_states, rnn_states, model, env_step_fn, train_config)
+        return (train_state, env_states, rnn_states, model), loss
+
+    (train_state, env_states, rnn_states, model), losses = jax.lax.scan(
+        train_step, (train_state, env_states, rnn_states, model), length=train_steps)
+    return train_state, env_states, rnn_states, model, losses
+
+
+def train(
+        train_state: TrainState,
+        env_states: ContinualARState,
+        rnn_states: xLSTMState,
+        model: eqx.Module,
+        env_step_fn: Callable,
+        train_config: DictConfig,
+    ):
+    steps_per_log = train_config.log_interval // (train_config.tbptt_window * train_config.batch_size)
+    total_steps = train_config.steps // (train_config.tbptt_window * train_config.batch_size)
     
-    (train_state, model), losses = jax.lax.scan(scannable_update, (train_state, model), None, n_steps)
-    return train_state, model, losses
+    env_steps_passed = 0
+    train_steps_passed = 0
+
+    with tqdm(total=train_config.steps) as pbar:
+        for _ in range(total_steps // steps_per_log):
+            train_state, env_states, rnn_states, model, losses = train_loop(
+                train_state, env_states, rnn_states, model, env_step_fn, train_config, steps_per_log)
+            avg_loss = jnp.nanmean(losses)
+            # if jnp.isnan(avg_loss):
+            #     print('Loss is nan, breakpoint!')
+            train_steps_passed += steps_per_log
+            env_steps_passed += steps_per_log * train_config.tbptt_window * train_config.batch_size
+            pbar.update(steps_per_log * train_config.tbptt_window * train_config.batch_size)
+            pbar.set_postfix({
+                'avg_loss': avg_loss,
+                'train_steps': train_steps_passed,
+                'env_steps': env_steps_passed
+            })
+
+
+@hydra.main(config_path='conf', config_name='train_base')
+def main(config: DictConfig) -> None:
+    print(config)
+
+    rng = jax.random.PRNGKey(config.get('seed', time.time_ns()))
+    model_key, env_key, rng = jax.random.split(rng, 3)
+
+    # Prepare model
+    model = create_model(model_key, config.model)
+    rnn_states = jax.vmap(lambda _: model.init_rnn_state())(jnp.arange(config.train.batch_size))
+    print('# Model params:', sum(jax.tree_leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
+
+    # Prepare optimizer
+    optimizer, opt_state = create_optimizer(model, config.optimizer)
+
+    # Prepare environment(s)
+    env_keys = jax.random.split(env_key, config.train.batch_size)
+    env_states = jax.vmap(init_environment, in_axes=(0, None))(env_keys, config.env)
+    env_step_fn = next_associative_recall_obs
+
+    # Train
+    train_state = TrainState(rng, opt_state, optimizer.update)
+    train(train_state, env_states, rnn_states, model, env_step_fn, config.train)
 
 
 if __name__ == '__main__':
-
-    learning_rate = 3e-4
-    tbptt_window = 40
-
-    vocab_size = VOCAB_SIZE
-    output_dim = VOCAB_SIZE
-    embedding_dim = 64
-    layer_sizes = [64, 128]
-    recurrent_layer_indices = [1]
-
-
-    rng = jax.random.PRNGKey(0)
-    model_key, train_key, rng = jax.random.split(rng, 3)
-
-    model = SupervisedModel(
-        rng = model_key,
-        vocab_size = vocab_size,
-        embedding_dim = embedding_dim,
-        layer_sizes = layer_sizes,
-        output_dim = output_dim,
-        recurrent_layer_indices = recurrent_layer_indices,
-    )
-
-    print(model)
-    
-    optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(model)
-
-    train_state = TrainState(
-        rng = train_key,
-        opt_state = opt_state,
-        tx_update_fn = optimizer.update,
-    )
-
-    jax_cpu = jax.devices(backend='cpu')[0]
-    train_fn = eqx.filter_jit(train_loop, device=jax_cpu)
-
-    train_state, model, losses = train_fn(train_state, model, tbptt_window, iters=1000)
-    print(f"Losses: {losses}")
-
-    print("Training completed. Final loss:", losses[-1])
-
-
-    # train_fn = eqx.filter_jit(batch_train_loop)
-
-    # train_state, model, losses = train_fn(train_state, model, tbptt_window, batch_size=32, n_steps=1000)
-    # print(f"Losses: {losses}")
+    main()
