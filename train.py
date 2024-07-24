@@ -8,6 +8,7 @@ import hydra
 import jax
 import jax.numpy as jnp
 from jaxtyping import PRNGKeyArray
+import omegaconf
 from omegaconf import DictConfig
 import optax
 from tqdm import tqdm
@@ -115,9 +116,9 @@ def train(
         rnn_states: xLSTMState,
         model: eqx.Module,
         env_step_fn: Callable,
-        train_config: DictConfig,
-        half_precision: bool = False,
+        config: DictConfig,
     ):
+    train_config = config.train
     steps_per_log = train_config.log_interval // (train_config.tbptt_window * train_config.batch_size)
     total_steps = train_config.steps // (train_config.tbptt_window * train_config.batch_size)
     
@@ -128,14 +129,18 @@ def train(
         for _ in range(total_steps // steps_per_log):
             train_state, env_states, rnn_states, model, accuracies, losses = train_loop(
                 train_state, env_states, rnn_states, model, env_step_fn,
-                train_config, steps_per_log, half_precision,
+                train_config, steps_per_log, config.get('half_precision', False),
             )
+
             avg_loss = jnp.nanmean(losses)
             avg_accuracy = jnp.nanmean(accuracies)
+
             if jnp.isnan(avg_loss):
                 print('Loss is nan, breakpoint!')
+
             train_steps_passed += steps_per_log
             env_steps_passed += steps_per_log * train_config.tbptt_window * train_config.batch_size
+
             pbar.update(steps_per_log * train_config.tbptt_window * train_config.batch_size)
             pbar.set_postfix({
                 'avg_loss': avg_loss,
@@ -144,10 +149,25 @@ def train(
                 'env_steps': env_steps_passed
             })
 
+            if config.wandb.get('enabled', False):
+                import wandb
+                wandb.log({
+                    'loss': avg_loss,
+                    'accuracy': avg_accuracy,
+                    'train_step': train_steps_passed,
+                    'env_step': env_steps_passed
+                })
+
 
 @hydra.main(config_path='conf', config_name='train_base')
 def main(config: DictConfig) -> None:
-    print(config)
+    print('Config:\n', config)
+
+    if config.wandb.get('enabled', False):
+        import wandb
+        wandb.config = omegaconf.OmegaConf.to_container(
+            config, resolve=True, throw_on_missing=True)
+        wandb.init(entity=config.wandb.get('entity'), project=config.wandb.get('project'))
 
     rng = jax.random.PRNGKey(config.get('seed', time.time_ns()))
     model_key, env_key, rng = jax.random.split(rng, 3)
@@ -170,10 +190,7 @@ def main(config: DictConfig) -> None:
 
     # Train
     train_state = TrainState(rng, opt_state, optimizer.update)
-    train(
-        train_state, env_states, rnn_states, model, env_step_fn,
-        config.train, config.half_precision,
-    )
+    train(train_state, env_states, rnn_states, model, env_step_fn, config)
 
 
 if __name__ == '__main__':

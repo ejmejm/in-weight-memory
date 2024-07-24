@@ -3,14 +3,14 @@ half_precision: True
 
 train:
   steps: 1_000_000  # In number of environment steps
-  tbptt_window: 30
-  batch_size: 32
-  log_interval: 30000 # In number of environment steps
+  tbptt_window: 20
+  batch_size: 16
+  log_interval: 10000 # In number of environment steps
 
 model:
   vocab_size: 36
-  hidden_dim: 512
-  n_blocks: 4
+  hidden_dim: 256
+  n_blocks: 2
   n_heads: 4
   ms_ratio: [1, 1]
   mlstm_kwargs: null
@@ -29,3 +29,8 @@ env:
   max_vars: 4
   test_recall_prob: 0.5
   fill_before_recall: True
+
+wandb:
+  enabled: False
+  entity: "ejmejm"
+  project: "associative_recall"
