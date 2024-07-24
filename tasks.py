@@ -3,7 +3,7 @@ from typing import Dict
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Integer, Scalar
+from jaxtyping import Array, Bool, Integer, Scalar
 
 from utils import tree_replace
 
@@ -109,6 +109,7 @@ class ContinualARState(eqx.Module):
     curr_sequence: Integer[Array, "name_length + val_length + 1"]
     curr_sequence_len: Integer[Scalar, ""]
     curr_sequence_idx: Integer[Scalar, ""]
+    seen_before: Bool[Scalar, ""]
 
 
     def __init__(
@@ -138,6 +139,7 @@ class ContinualARState(eqx.Module):
         self.curr_sequence = jnp.zeros((name_length + val_length + 2), dtype=jnp.int32)
         self.curr_sequence_len = jnp.array(0, dtype=jnp.int32)
         self.curr_sequence_idx = jnp.array(0, dtype=jnp.int32)
+        self.seen_before = jnp.array(False, dtype=jnp.bool)
 
 
 def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
@@ -157,7 +159,6 @@ def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
             - target_id: The target id for the next step.
             - loss_mask: 1 for all value parts of the output sequence and 0 elsewhere.
     """
-
     def reset_sequence(state):
         rng, name_rng, val_rng, association_rng = jax.random.split(state.rng, 4)
         
@@ -171,6 +172,7 @@ def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
             idx = jax.random.randint(association_rng, (), minval=0, maxval=state.n_curr_vars)
             name = state.curr_names[idx]
             val = state.curr_vals[idx]
+            state = tree_replace(state, seen_before=jnp.array(True, dtype=jnp.bool))
             return name, val, state
 
         def create_new_association(state):
@@ -208,6 +210,7 @@ def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
                 record_new_association,
                 existing_mask,
             )
+            update_vars['seen_before'] = jnp.array(False, dtype=jnp.bool)
             state = tree_replace(state, **update_vars)
             return name, val, state
 
@@ -249,12 +252,13 @@ def next_associative_recall_obs(state: ContinualARState) -> Dict[str, Array]:
             state.curr_sequence_idx < state.name_length + state.val_length - 1,
         ),
         1, 0,
-    )
+    ) * state.seen_before
 
     return state, {
-        "input_id": input_id,
-        "target_id": target_id,
+        "input_ids": input_id,
+        "target_ids": target_id,
         "loss_mask": loss_mask,
+        "seen_before": state.seen_before,
     }
 
 
@@ -271,6 +275,6 @@ if __name__ == '__main__':
 
     all_obs = jax.tree.map(lambda *args: jnp.stack(args), *all_obs)
     
-    print(f'Input sequence:\n{decode_sequence(all_obs["input_id"])}\n')
-    print(f'Target sequence:\n{decode_sequence(all_obs["target_id"])}\n')
+    print(f'Input sequence:\n{decode_sequence(all_obs["input_ids"])}\n')
+    print(f'Target sequence:\n{decode_sequence(all_obs["target_ids"])}\n')
     print(f'Loss mask:\n{all_obs["loss_mask"]}')
