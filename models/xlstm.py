@@ -9,7 +9,6 @@ from jaxtyping import PRNGKeyArray
 from .mlstm import mLSTMBlock, mLSTMBlockState
 from .slstm import sLSTMBlock, sLSTMBlockState
 
-
 xLSTMState = Tuple[Union[mLSTMBlockState, sLSTMBlockState]]
 
 

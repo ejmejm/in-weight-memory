@@ -12,7 +12,7 @@ from equinox import nn
 from equinox._misc import default_floating_dtype
 
 
-mLSTMState = NamedTuple('mLSTMState', h=Array, c=Array, n=Array)
+mLSTMState = NamedTuple('mLSTMState', h=Array, c=Array, m=Array, n=Array)
 mLSTMBlockState = NamedTuple('mLSTMBlockState', cell_state=mLSTMState, block_state=Array)
 
 
@@ -115,6 +115,7 @@ class mLSTMCell(eqx.Module, strict=True):
         return mLSTMState(
             jnp.zeros((self.n_heads, self.head_size)),
             jnp.zeros((self.n_heads, self.head_size, self.head_size)),
+            jnp.zeros((self.n_heads,)),
             jnp.zeros((self.n_heads, self.head_size)),
         )
 
@@ -140,7 +141,7 @@ class mLSTMCell(eqx.Module, strict=True):
             The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
             `(hidden_size,)`.
         """
-        prev_h, prev_c, prev_n = rnn_state
+        prev_h, prev_c, prev_m, prev_n = rnn_state
 
         # Calculate gate values
         i_f = jnp.inner(self.if_weights, input)
@@ -150,10 +151,12 @@ class mLSTMCell(eqx.Module, strict=True):
             i_f += self.if_bias
             o += self.o_bias
 
-        i, f = i_f.T
-        i = jnp.exp(i)
-        f = jnp.exp(f)
         o = jnn.sigmoid(o)
+
+        i, f = i_f.T
+        m = jnp.maximum(f + prev_m, i)
+        i = jnp.exp(i - m)
+        f = jnp.exp(f + prev_m - m)
 
         if not self.separate_value_input:
             v_input = input
@@ -180,7 +183,7 @@ class mLSTMCell(eqx.Module, strict=True):
         )[:, None]
         h = o * h
 
-        return mLSTMState(h, c, n), h.reshape(self.hidden_size)
+        return mLSTMState(h, c, m, n), h.reshape(self.hidden_size)
 
 
 class mLSTMBlock(eqx.Module):
