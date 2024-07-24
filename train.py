@@ -73,8 +73,9 @@ def batch_train_iter(
         train_sequences['loss_mask'] = train_sequences['loss_mask'].astype(jnp.bfloat16)
     
     batch_loss_and_grads = jax.vmap(supervised_loss_and_grads, (None, 0, 0))
-    losses, grads, rnn_states = batch_loss_and_grads(model, rnn_states, train_sequences)
+    losses, grads, accuracies, rnn_states = batch_loss_and_grads(model, rnn_states, train_sequences)
     loss = jnp.mean(losses)
+    accuracy = jnp.mean(accuracies)
     grads = jax.tree.map(lambda x: jnp.mean(x, axis=0), grads) # Average over gradients
     
     train_state, model = apply_grads(
@@ -83,7 +84,7 @@ def batch_train_iter(
         grads,
     )
 
-    return train_state, env_states, rnn_states, model, loss
+    return train_state, env_states, rnn_states, model, accuracy, loss
 
 
 @partial(jax.jit, static_argnums=(4, 5, 6, 7))
@@ -99,13 +100,13 @@ def train_loop(
     ):
     def train_step(carry, _):
         train_state, env_states, rnn_states, model = carry
-        train_state, env_states, rnn_states, model, loss = batch_train_iter(
+        train_state, env_states, rnn_states, model, accuracy, loss = batch_train_iter(
             train_state, env_states, rnn_states, model, env_step_fn, train_config, half_precision)
-        return (train_state, env_states, rnn_states, model), loss
+        return (train_state, env_states, rnn_states, model), (accuracy, loss)
 
-    (train_state, env_states, rnn_states, model), losses = jax.lax.scan(
+    (train_state, env_states, rnn_states, model), (accuracies, losses) = jax.lax.scan(
         train_step, (train_state, env_states, rnn_states, model), length=train_steps)
-    return train_state, env_states, rnn_states, model, losses
+    return train_state, env_states, rnn_states, model, accuracies, losses
 
 
 def train(
@@ -125,11 +126,12 @@ def train(
 
     with tqdm(total=train_config.steps) as pbar:
         for _ in range(total_steps // steps_per_log):
-            train_state, env_states, rnn_states, model, losses = train_loop(
+            train_state, env_states, rnn_states, model, accuracies, losses = train_loop(
                 train_state, env_states, rnn_states, model, env_step_fn,
                 train_config, steps_per_log, half_precision,
             )
             avg_loss = jnp.nanmean(losses)
+            avg_accuracy = jnp.nanmean(accuracies)
             if jnp.isnan(avg_loss):
                 print('Loss is nan, breakpoint!')
             train_steps_passed += steps_per_log
@@ -137,6 +139,7 @@ def train(
             pbar.update(steps_per_log * train_config.tbptt_window * train_config.batch_size)
             pbar.set_postfix({
                 'avg_loss': avg_loss,
+                'avg_accuracy': avg_accuracy,
                 'train_steps': train_steps_passed,
                 'env_steps': env_steps_passed
             })

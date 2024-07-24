@@ -3,6 +3,7 @@ from typing import Callable, Dict, Tuple
 import equinox as eqx
 import optax
 import jax
+import jax.nn as jnn
 from jax import Array
 import jax.numpy as jnp
 from jaxtyping import PRNGKeyArray
@@ -41,20 +42,22 @@ def supervised_loss_and_grads(
 
         rnn_state, pred_ids = model.forward_sequence(rnn_state, input_tokens)
         loss = optax.softmax_cross_entropy_with_integer_labels(pred_ids, target_tokens) * loss_mask
+        n_correct = jnp.sum((jnp.argmax(pred_ids, axis=1) == target_tokens) * loss_mask)
         n_targets = jnp.sum(loss_mask)
         loss = jax.lax.cond(n_targets > 0, lambda x: jnp.sum(x), lambda _: jnp.array(0.0, dtype=loss.dtype), loss)
-        return loss, (n_targets, rnn_state)
-    
+        return loss, (n_targets, n_correct, rnn_state)
+
     value_grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
 
     # Compute loss and gradients over the entire sequence
-    (loss, (total_labels, rnn_state)), grads = value_grad_fn(model, rnn_state, sequence)
+    (loss, (total_labels, total_correct, rnn_state)), grads = value_grad_fn(model, rnn_state, sequence)
 
     # Normalize the loss and gradients
     loss /= total_labels
+    accuracy = total_correct / total_labels
     grads = jax.tree_map(lambda x: x / total_labels, grads)
 
-    return loss, grads, rnn_state
+    return loss, grads, accuracy, rnn_state
 
 
 def supervised_scan_loss_and_grads(
