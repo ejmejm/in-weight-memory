@@ -1,5 +1,6 @@
 seed: 0
 half_precision: True
+cache_jit: True
 
 train:
   steps: 1_000_000  # In number of environment steps

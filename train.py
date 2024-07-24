@@ -1,5 +1,6 @@
 from functools import partial
 import math
+import tempfile
 import time
 from typing import Callable, Tuple
 
@@ -7,6 +8,7 @@ import equinox as eqx
 import hydra
 import jax
 import jax.numpy as jnp
+from jax.experimental.compilation_cache import compilation_cache
 from jaxtyping import PRNGKeyArray
 import omegaconf
 from omegaconf import DictConfig
@@ -168,6 +170,10 @@ def main(config: DictConfig) -> None:
         wandb.config = omegaconf.OmegaConf.to_container(
             config, resolve=True, throw_on_missing=True)
         wandb.init(entity=config.wandb.get('entity'), project=config.wandb.get('project'))
+
+    # Cache jitted functions
+    if config.get('cache_jit', False):
+        compilation_cache.set_cache_dir(tempfile.tempdir)
 
     rng = jax.random.PRNGKey(config.get('seed', time.time_ns()))
     model_key, env_key, rng = jax.random.split(rng, 3)
