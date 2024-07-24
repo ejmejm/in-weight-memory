@@ -1,0 +1,37 @@
+program: train.py
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+
+method: grid
+metric:
+  goal: minimize
+  name: loss
+
+parameters:
+  wandb.enabled:
+    value: True
+  wandb.project:
+    value: "associative_recall_baseline"
+
+  train.steps:
+    value: 500_000
+  train.tbptt_window:
+    value: 20
+  train.batch_size:
+    value: 16
+
+  model.hidden_dim:
+    value: 512
+  model.n_blocks:
+    value: 4
+  model.n_heads:
+    value: 8
+
+  env.max_vars:
+    values: [1, 2, 4, 8, 16, 32, 64]
+  seed:
+    values: [0]
