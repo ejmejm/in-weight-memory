@@ -6,7 +6,7 @@ train:
   steps: 1_000_000  # In number of environment steps
   tbptt_window: 20
   batch_size: 16
-  log_interval: 10000 # In number of environment steps
+  log_interval: 10_000 # In number of environment steps
 
 model:
   vocab_size: 36
