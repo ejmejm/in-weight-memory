@@ -1,6 +1,7 @@
 import math
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Sequence, Tuple
 
+from einops import rearrange
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
@@ -12,8 +13,12 @@ from equinox import nn
 from equinox._misc import default_floating_dtype
 
 
-mLSTMState = NamedTuple('mLSTMState', h=Array, c=Array, m=Array, n=Array)
+mLSTMState = NamedTuple('mLSTMState', h=Array, c=Array, m=Array, n=Array, history=Array, step=Array)
 mLSTMBlockState = NamedTuple('mLSTMBlockState', cell_state=mLSTMState, block_state=Array)
+
+
+def batch_dot(a: Array, b: Array):
+    return jnp.sum(a * b, axis=-1)
 
 
 class mLSTMCell(eqx.Module, strict=True):
@@ -36,12 +41,14 @@ class mLSTMCell(eqx.Module, strict=True):
                 return final_state
         ```
     """
-    if_weights: Array
+    ifr_weights: Array
     o_weights: Array
     kq_weights: Array
     v_weights: Array
+    mem_kvq_weights: Array
     kvq_bias: Optional[Array]
-    if_bias: Optional[Array]
+    mem_kvq_bias: Optional[Array]
+    ifr_bias: Optional[Array]
     o_bias: Optional[Array]
     input_size: int = eqx.field(static=True)
     hidden_size: int = eqx.field(static=True)
@@ -80,11 +87,11 @@ class mLSTMCell(eqx.Module, strict=True):
         self.n_heads = n_heads
 
         dtype = default_floating_dtype() if dtype is None else dtype
-        ih_key, o_key, kv_key, q_key, ihb_key, ob_key, kvqb_key = jrandom.split(key, 7)
+        ih_key, o_key, kv_key, q_key, mem_key, ihb_key, ob_key, kvqb_key, memb_key = jrandom.split(key, 9)
         lim = math.sqrt(1 / self.head_size)
 
-        self.if_weights = jrandom.uniform(
-            ih_key, (n_heads, 2, input_size), minval=-lim, maxval=lim, dtype=dtype)
+        self.ifr_weights = jrandom.uniform(
+            ih_key, (n_heads, 3, input_size), minval=-lim, maxval=lim, dtype=dtype)
         self.o_weights = jrandom.uniform(
             o_key, (n_heads, self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
         self.kq_weights = jrandom.uniform(
@@ -92,19 +99,22 @@ class mLSTMCell(eqx.Module, strict=True):
         self.v_weights = jrandom.uniform(
             q_key, (n_heads, self.head_size, input_size), minval=-lim, maxval=lim, dtype=dtype)
 
+        self.mem_kvq_weights = jrandom.uniform(
+            mem_key, (n_heads, 3, self.head_size), minval=-lim, maxval=lim, dtype=dtype)
+
         if use_bias:
-            self.if_bias = jrandom.uniform(
-                ihb_key, (n_heads, 2,), minval=-lim, maxval=lim, dtype=dtype
-            )
+            self.ifr_bias = jrandom.uniform(
+                ihb_key, (n_heads, 3,), minval=-lim, maxval=lim, dtype=dtype)
             self.o_bias = jrandom.uniform(
-                ob_key, (n_heads, self.head_size,), minval=-lim, maxval=lim, dtype=dtype
-            )
+                ob_key, (n_heads, self.head_size,), minval=-lim, maxval=lim, dtype=dtype)
             self.kvq_bias = jrandom.uniform(
-                kvqb_key, (n_heads, 3, self.head_size,), minval=-lim, maxval=lim, dtype=dtype
-            )
+                kvqb_key, (n_heads, 3, self.head_size,), minval=-lim, maxval=lim, dtype=dtype)
+            self.mem_kvq_bias = jrandom.uniform(
+                memb_key, (n_heads, 3, self.head_size,), minval=-lim, maxval=lim, dtype=dtype)
         else:
             self.bias = None
             self.kvq_bias = None
+            self.mem_kvq_bias = None
 
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -117,6 +127,8 @@ class mLSTMCell(eqx.Module, strict=True):
             jnp.zeros((self.n_heads, self.head_size, self.head_size)),
             jnp.zeros((self.n_heads,)),
             jnp.zeros((self.n_heads, self.head_size)),
+            jnp.zeros((6, self.n_heads, self.head_size, self.head_size)),
+            jnp.array(0),
         )
 
     @jax.named_scope("mLSTMCell")
@@ -141,22 +153,23 @@ class mLSTMCell(eqx.Module, strict=True):
             The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
             `(hidden_size,)`.
         """
-        prev_h, prev_c, prev_m, prev_n = rnn_state
+        prev_h, prev_c, prev_m, prev_n, prev_cell_history, cell_step = rnn_state
 
         # Calculate gate values
-        i_f = jnp.inner(self.if_weights, input)
+        ifr = jnp.inner(self.ifr_weights, input)
         o = self.o_weights @ input
 
         if self.use_bias:
-            i_f += self.if_bias
+            ifr += self.ifr_bias
             o += self.o_bias
 
         o = jnn.sigmoid(o)
 
-        i, f = i_f.T
+        i, f, r = ifr.T
         m = jnp.maximum(f + prev_m, i)
         i = jnp.exp(i - m)
         f = jnp.exp(f + prev_m - m)
+        r = jnn.sigmoid(r)
 
         if not self.separate_value_input:
             v_input = input
@@ -176,14 +189,49 @@ class mLSTMCell(eqx.Module, strict=True):
         # Calculate recurrent values
         n = f[:, None] * prev_n + i[:, None] * k
         c = f[:, None, None] * prev_c + i[:, None, None] * v[:, :, None] @ k[:, None, :]
-        h = (c @ q[:, :, None]).squeeze(2)
+
+        
+        def update_cell_history():
+            cell_history = jnp.roll(prev_cell_history, -1, axis=0)
+            cell_history = cell_history.at[-1].set(c)
+            return cell_history
+
+        cell_history = jax.lax.cond(
+            cell_step % 20 == 0,
+            update_cell_history,
+            lambda: prev_cell_history,
+        )
+
+
+        ####### Calculate retrieval from history #######
+
+        # self.mem_kvq_weights # (n_heads, 3, self.head_size)
+        # c_hist # (sequence_len, self.n_heads, self.head_size, self.head_size)
+
+
+        # (sequence_len, self.n_heads, 3, self.head_size)
+        mem_kvq = self.mem_kvq_weights[None] @ cell_history
+        mem_kvq += self.mem_kvq_bias[None]
+
+        k, v, _ = rearrange(mem_kvq, 's nh l hs -> l s nh hs')
+
+        query_result = batch_dot(q[-1:], k) / jnp.sqrt(self.head_size) # -> (s, nh)
+        attn_weights = jnn.softmax(query_result, axis=0)
+        attn_out = jnp.sum(attn_weights[:, :, None, None] * cell_history, axis=0) # -> (nh, hs, hs)
+
+        ########
+
+
+        # c += r[:, None, None] * attn_out
+
+        h = (c @ q[:, :, None]).squeeze(2) + r[:, None] * (attn_out @ q[:, :, None]).squeeze(2)
         h /= jnp.maximum(
             jnp.abs(n[:, None, :] @ q[:, :, None]).squeeze((1, 2,)),
             jnp.ones(self.n_heads, dtype=int),
         )[:, None]
         h = o * h
 
-        return mLSTMState(h, c, m, n), h.reshape(self.hidden_size)
+        return mLSTMState(h, c, m, n, cell_history, cell_step + 1), h.reshape(self.hidden_size)
 
 
 class mLSTMBlock(eqx.Module):
