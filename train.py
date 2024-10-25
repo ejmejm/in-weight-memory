@@ -161,6 +161,13 @@ def train(
                 })
 
 
+def to_half_precision(x: jax.Array):
+    """Convert array to bf16 if it's a full precision float."""
+    if x.dtype == jnp.float32:
+        return x.astype(jnp.bfloat16)
+    return x
+    
+
 @hydra.main(config_path='conf', config_name='train_base')
 def main(config: DictConfig) -> None:
     print('Config:\n', config)
@@ -181,8 +188,9 @@ def main(config: DictConfig) -> None:
     # Prepare model
     model = create_model(model_key, config.model, config.half_precision)
     rnn_states = jax.vmap(lambda _: model.init_rnn_state())(jnp.arange(config.train.batch_size))
+
     if config.half_precision:
-        rnn_states = jax.tree.map(lambda x: x.astype(jnp.bfloat16), rnn_states)
+        rnn_states = jax.tree.map(to_half_precision, rnn_states)
 
     print('# Model params:', sum(jax.tree.leaves(jax.tree.map(lambda x: math.prod(x.shape), model))))
 
