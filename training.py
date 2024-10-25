@@ -3,7 +3,6 @@ from typing import Callable, Dict, Tuple
 import equinox as eqx
 import optax
 import jax
-import jax.nn as jnn
 from jax import Array
 import jax.numpy as jnp
 from jaxtyping import PRNGKeyArray
@@ -35,7 +34,30 @@ def supervised_loss_and_grads(
         rnn_state: LSTMState,
         sequence: Dict[str, Array],
     ):
+    """
+    Computes the supervised loss and gradients for a given model and sequence.
+
+    This function calculates the loss and gradients over the entire input sequence
+    using softmax cross-entropy loss. It also computes the accuracy of the model's
+    predictions.
+
+    Args:
+        model: A recurrent model.
+        rnn_state: The initial state of the RNN.
+        sequence: A dictionary containing 'input_ids', 'target_ids', and 'loss_mask'.
+
+    Returns:
+        A tuple containing:
+        - loss: The normalized loss value.
+        - grads: The gradients of the model parameters.
+        - accuracy: The prediction accuracy.
+        - rnn_state: The final state of the RNN after processing the sequence.
+    """
     def loss_fn(model: eqx.Module, rnn_state: LSTMState, subsequence: Dict[str, Array]):
+        """
+        Computes the loss for a given model, RNN state, and subsequence.
+        Returns the loss value along with the number of targets, correct predictions, and updated RNN state.
+        """
         input_tokens = subsequence['input_ids']
         target_tokens = subsequence['target_ids']
         loss_mask = subsequence['loss_mask']
@@ -66,7 +88,30 @@ def supervised_scan_loss_and_grads(
         sequence: Dict[str, Array],
         tbptt_window: int = 4,
     ):
+    """
+    Computes the supervised loss and gradients using truncated backpropagation through time (TBPTT).
+
+    This function splits the input sequence into subsequences of length `tbptt_window`,
+    computes the loss and gradients for each subsequence, and then aggregates the results.
+    This approach allows for more efficient computation on longer sequences.
+
+    Args:
+        model: A recurrent model.
+        rnn_state: The initial state of the RNN.
+        sequence: A dictionary containing 'input_ids', 'target_ids', and 'loss_mask'.
+        tbptt_window: The length of subsequences for truncated backpropagation.
+
+    Returns:
+        A tuple containing:
+        - loss: The normalized loss value.
+        - grads: The gradients of the model parameters.
+        - rnn_state: The final state of the RNN after processing the entire sequence.
+    """
     def loss_fn(model: eqx.Module, rnn_state: LSTMState, subsequence: Dict[str, Array]):
+        """
+        Computes the loss for a given model, RNN state, and subsequence.
+        Returns the loss value along with the number of targets and updated RNN state.
+        """
         input_tokens = subsequence['input_ids']
         target_tokens = subsequence['target_ids']
         loss_mask = subsequence['loss_mask']
@@ -80,6 +125,10 @@ def supervised_scan_loss_and_grads(
     value_grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
 
     def scannable_value_grad_fn(state: Tuple[Array, Array, eqx.Module, LSTMState], subsequence: Dict[str, Array]):
+        """
+        Computes loss and gradients for a subsequence, and updates the running totals.
+        Returns the updated state and the loss for this subsequence.
+        """
         loss_sum, total_labels, grads_sum, rnn_state = state
         (loss, (n_labels, rnn_state)), grads = value_grad_fn(model, rnn_state, subsequence)
 
@@ -120,6 +169,23 @@ def apply_grads(
         model: eqx.Module,
         grads: eqx.Module,
     ):
+    """
+    Applies computed gradients to update the model and training state.
+
+    This function applies the optimizer update to the model parameters using the
+    computed gradients. It also handles gradient clipping by replacing NaN values
+    with zeros to prevent numerical instability.
+
+    Args:
+        train_state: The current training state, including optimizer state.
+        model: The model to be updated.
+        grads: The computed gradients for the model parameters.
+
+    Returns:
+        A tuple containing:
+        - train_state: The updated training state.
+        - new_model: The updated model.
+    """
     # Replace nan grads with 0
     grads = jax.tree_map(lambda x: jnp.where(jnp.isnan(x), 0, x), grads)
     updates, new_opt_state = train_state.tx_update_fn(grads, train_state.opt_state, model)
