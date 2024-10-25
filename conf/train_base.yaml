@@ -1,5 +1,5 @@
 seed: 0
-half_precision: True
+half_precision: False
 cache_jit: True
 
 train:
