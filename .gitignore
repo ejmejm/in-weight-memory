@@ -1,5 +1,6 @@
 legacy/
 **/__pycache__/
 .vscode/
+**/wandb/
 
 lstm_scaling_experiment.ipynb
