@@ -17,7 +17,8 @@ from transformers import GPT2Tokenizer
 from tqdm import tqdm
 import wandb
 
-from model import MultiLayerRNN, StoryNetwork
+from model import MultiLayerRNN
+from tokenization import CharacterTokenizer
 
 
 # Repetitive phrases to remove from the TinyStories dataset
@@ -70,95 +71,7 @@ def collate_batch(batch, tokenizer, max_length):
     }
 
 
-def sigmoid_linear(x):
-    """x < 0 -> sigmoid(x), x >= 0 -> x + 0.5"""
-    return torch.where(x >= 0, x + 0.5, x.sigmoid())
-
-
-def inverse_sigmoid_linear(x):
-    """Inverse sigmoid linear function"""
-    return torch.where(x >= 0.5, x - 0.5, torch.log(x / (1 - x)))
-    
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--learning_rate', type=float, default=3e-4)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--eval_every', type=int, default=1)
-    parser.add_argument('--use_wandb', action='store_true')
-    parser.add_argument('--max_length', type=int, default=128)
-    parser.add_argument('--n_heads', type=int, default=1)
-    parser.add_argument('--expansion_factor', type=float, default=1.0)
-    parser.add_argument('--use_normal_gru', dest='use_min_gru', action='store_false')
-    parser.add_argument('--repeat_sequence', action='store_true', default=False)
-    parser.add_argument('--two_step_forward', action='store_true', default=False)
-    parser.add_argument('--modify_memories', action='store_true', default=False)
-    parser.add_argument('--model_type', type=str, default='multi_layer')
-    
-    return parser.parse_args()
-
-
-class CharacterTokenizer:
-    """Simple character-level tokenizer that treats each character as a token."""
-    
-    def __init__(self):
-        # Create vocabulary from printable ASCII characters
-        self.chars = [chr(i) for i in range(32, 127)] + ['\n']
-        self.vocab = {char: i for i, char in enumerate(self.chars)}
-        self.vocab['<pad>'] = len(self.vocab)  # Add padding token
-        self.vocab['<bos>'] = len(self.vocab)  # Add beginning of sequence token
-        self.vocab['<eos>'] = len(self.vocab)  # Add end of sequence token
-        
-        # Create reverse mapping
-        self.id_to_char = {i: char for char, i in self.vocab.items()}
-        
-        # Special tokens
-        self.pad_token = '<pad>'
-        self.bos_token = '<bos>'
-        self.eos_token = '<eos>'
-        self.pad_token_id = self.vocab[self.pad_token]
-    
-    def __len__(self) -> int:
-        return len(self.vocab)
-    
-    def __call__(self, texts: List[str], truncation: bool = False, max_length: int = None, **kwargs) -> dict:
-        """
-        Tokenize a batch of texts into token ids.
-        
-        Args:
-            texts: List of strings to tokenize
-            truncation: Whether to truncate sequences longer than max_length
-            max_length: Maximum sequence length (including special tokens)
-            
-        Returns:
-            Dictionary with input_ids for each text
-        """
-        if isinstance(texts, str):
-            texts = [texts]
-            
-        all_ids = []
-        for text in texts:
-            ids = [self.vocab.get(c, self.vocab['<pad>']) for c in text[:max_length]]
-            all_ids.append(ids)
-            
-        return {'input_ids': all_ids}
-
-
-if __name__ == '__main__':
-    args = parse_args()
-    
-    # Set device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-    # # Load tokenizer
-    # tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    # if tokenizer.pad_token is None:
-    #     tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer = CharacterTokenizer()
-
+def prepare_dataloaders(tokenizer, args):
     # Load dataset
     dataset = load_dataset('roneneldan/TinyStories')
     dataset['train'] = dataset['train'].select(range(100000))
@@ -186,56 +99,48 @@ if __name__ == '__main__':
         num_workers=0,
         collate_fn=lambda b: collate_batch(b, tokenizer, args.max_length)
     )
+
+    return train_loader, val_loader
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a multi-layer RNN model on the TinyStories dataset")
+    parser.add_argument('--d_model', type=int, default=512,
+                        help='Hidden dimension size of the model')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--eval_every', type=int, default=1,
+                        help='Run validation every N epochs')
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--max_length', type=int, default=128,
+                        help='Maximum sequence length for truncation')
+    parser.add_argument('--expansion_factor', type=float, default=1.0,
+                        help='Factor to expand hidden dimension in the GRU layers')
+    parser.add_argument('--repeat_sequence', action='store_true', default=False,
+                        help='Change the task from next-token prediction to the copying task')
     
-
-    if args.model_type == 'multi_layer':
-        model_cls = MultiLayerRNN
-    elif args.model_type == 'story':
-        model_cls = StoryNetwork
+    return parser.parse_args()
 
 
-    class MemoryNetwork(model_cls):
-        def __init__(self, *args, **kwargs):
-            if 'expansion_factor' not in kwargs:
-                kwargs['expansion_factor'] = 2.0
-            super().__init__(*args, **kwargs)
-            self.memory_dim = int(self.d_model * kwargs['expansion_factor'])
-            mlp_ratio = getattr(self, 'mlp_ratio', 4.0)
-            
-            hidden_dim = int(self.memory_dim * mlp_ratio)
-            self.gate_proj = nn.Linear(self.memory_dim, hidden_dim, bias=False)
-            self.up_proj = nn.Linear(self.memory_dim, hidden_dim, bias=False)
-            self.down_proj = nn.Linear(hidden_dim, self.memory_dim, bias=False)
-            self.act_fn = nn.SiLU()
-        
-        def modify_memory_states(self, memory_states: List[torch.Tensor]) -> torch.Tensor:
-            initial_states = torch.stack(memory_states)
-            
-            # MLP with gating
-            gate_output = self.act_fn(self.gate_proj(initial_states))
-            up_output = self.up_proj(initial_states)
-            modified_states = self.down_proj(gate_output * up_output)
-            
-            # minGRU needs to have a positive recurrent state
-            if self.use_min_gru:
-                modified_states = inverse_sigmoid_linear(initial_states) + modified_states
-                modified_states = sigmoid_linear(modified_states)
-            else:
-                modified_states = torch.atanh(initial_states) + modified_states
-                modified_states = torch.tanh(modified_states)
-            
-            return modified_states # sigmoid_linear(self.memory_integration_layer(future_state))
+if __name__ == '__main__':
+    args = parse_args()
+    
+    # Set device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    tokenizer = CharacterTokenizer()
 
-    parent_model_cls = MemoryNetwork if args.modify_memories else model_cls
+    train_loader, val_loader = prepare_dataloaders(tokenizer, args)
 
     # Initialize model
-    model = parent_model_cls(
+    model = MultiLayerRNN(
         vocab_size=len(tokenizer),
         d_model=args.d_model,
         expansion_factor=args.expansion_factor,
-        use_min_gru=args.use_min_gru,
-        n_heads=args.n_heads,
+        use_min_gru=False,
+        n_heads=1,
     ).to(device)
 
     # Setup optimizer
@@ -277,22 +182,12 @@ if __name__ == '__main__':
             input_ids = batch['input_ids'].to(device)
             target_ids = batch['labels'].to(device)
 
-
             if args.repeat_sequence:
                 input_ids = input_ids.repeat(1, 2)
                 target_ids = target_ids.repeat(1, 2)
                 target_ids[:, :len(target_ids) // 2] = -100 # Only predict second half of the sequence
 
-            if args.repeat_sequence and args.two_step_forward:
-                _, prev_hidden_state = model(input_ids[:, :len(input_ids) // 2])
-                
-                if args.modify_memories:
-                    prev_hidden_state = model.modify_memory_states(prev_hidden_state)
-                    
-                logits, _ = model(input_ids[:, len(input_ids) // 2:], prev_hidden_state)
-                target_ids = target_ids[:, len(target_ids) // 2:]
-            else:
-                logits, _ = model(input_ids)
+            logits, _ = model(input_ids)
 
 
             loss = nn.functional.cross_entropy(
@@ -348,16 +243,7 @@ if __name__ == '__main__':
                     target_ids[:, :len(target_ids) // 2] = -100 # Only predict second half of the sequence
 
                 with torch.no_grad():
-                    if args.repeat_sequence and args.two_step_forward:
-                        _, prev_hidden_state = model(input_ids[:, :len(input_ids) // 2])
-                        
-                        if args.modify_memories:
-                            prev_hidden_state = model.modify_memory_states(prev_hidden_state)
-                            
-                        logits, _ = model(input_ids[:, len(input_ids) // 2:], prev_hidden_state)
-                        target_ids = target_ids[:, len(target_ids) // 2:]
-                    else:
-                        logits, _ = model(input_ids)
+                    logits, _ = model(input_ids)
                 
                 
                 # Calculate loss
