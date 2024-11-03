@@ -274,7 +274,7 @@ if __name__ == '__main__':
 
     # Initialize wandb if requested
     if args.use_wandb:
-        wandb.init(project='story-mingru-testing-v2', config=args)
+        wandb.init(project='story-gru-testing-v1', config=args)
 
     ### Start Training ###
 
@@ -295,16 +295,16 @@ if __name__ == '__main__':
             if args.repeat_sequence:
                 input_ids = input_ids.repeat(1, 2)
                 target_ids = target_ids.repeat(1, 2)
-                target_ids[:, :len(target_ids) // 2] = -100 # Only predict second half of the sequence
+                target_ids[:, :target_ids.shape[1] // 2] = -100 # Only predict second half of the sequence
 
             if args.repeat_sequence and args.two_step_forward:
-                _, prev_hidden_state = model(input_ids[:, :len(input_ids) // 2])
+                _, prev_hidden_state = model(input_ids[:, :input_ids.shape[1] // 2])
                 
                 if args.modify_memories:
                     prev_hidden_state = model.modify_memory_states(prev_hidden_state)
                     
-                logits, _ = model(input_ids[:, len(input_ids) // 2:], prev_hidden_state)
-                target_ids = target_ids[:, len(target_ids) // 2:]
+                logits, _ = model(input_ids[:, input_ids.shape[1] // 2:], prev_hidden_state)
+                target_ids = target_ids[:, input_ids.shape[1] // 2:]
             else:
                 logits, _ = model(input_ids)
 
@@ -359,17 +359,17 @@ if __name__ == '__main__':
                 if args.repeat_sequence:
                     input_ids = input_ids.repeat(1, 2)
                     target_ids = target_ids.repeat(1, 2)
-                    target_ids[:, :len(target_ids) // 2] = -100 # Only predict second half of the sequence
+                    target_ids[:, :target_ids.shape[1] // 2] = -100 # Only predict second half of the sequence
 
                 with torch.no_grad():
                     if args.repeat_sequence and args.two_step_forward:
-                        _, prev_hidden_state = model(input_ids[:, :len(input_ids) // 2])
+                        _, prev_hidden_state = model(input_ids[:, :input_ids.shape[1] // 2])
                         
                         if args.modify_memories:
                             prev_hidden_state = model.modify_memory_states(prev_hidden_state)
                             
-                        logits, _ = model(input_ids[:, len(input_ids) // 2:], prev_hidden_state)
-                        target_ids = target_ids[:, len(target_ids) // 2:]
+                        logits, _ = model(input_ids[:, input_ids.shape[1] // 2:], prev_hidden_state)
+                        target_ids = target_ids[:, input_ids.shape[1] // 2:]
                     else:
                         logits, _ = model(input_ids)
                 

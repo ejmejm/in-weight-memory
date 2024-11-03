@@ -129,8 +129,7 @@ class GRUWrapper(nn.Module):
         """
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
-            prev_hidden: Optional previous hidden state of shape (batch, 1, dim) or (batch, n_heads, 1, head_dim)
-            return_next_prev_hidden: Whether to return the last hidden state
+            prev_hidden: Optional previous hidden state of shape (batch, 1, dim)
         """
         prev_hidden = prev_hidden.transpose(0, 1) if prev_hidden is not None else None
         out, hidden = self.gru(x, prev_hidden)
@@ -297,6 +296,8 @@ class MultiLayerRNN(nn.Module):
         assert n_heads <= 1 or not use_min_gru, 'Multi-head GRUs only supported with regular GRUs'
         
         self.d_model = d_model
+        self.expansion_factor = expansion_factor
+        self.d_gru_hidden = int(d_model * expansion_factor)
         self.norm_cls = nn.LayerNorm
         self.mlp_ratio = mlp_ratio
         self.use_min_gru = use_min_gru
