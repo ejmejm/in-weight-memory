@@ -1,9 +1,32 @@
 ### Experiment Set 2 ###
 #
-# The purpose of this file is to run experiments to 
+# The purpose of this file is to test different ways of mixing past recurrent states (memories) with the current state.
+# Experiments use the TinyStories dataset and a multi-layer RNN model.
+# Each sequence is split into three parts:
 #
+# 1. Memory formation (first half): The model processes this part to form initial memories/recurrent states
+# 2. Query section (next quarter): Used to generate a recurrent state that should be mixed with memories
+# 3. Prediction section (final quarter): The model is only trained to predict tokens in this section
 #
-# Ran experiments with:
+# We ran two types of baseline experiments:
+#
+# - Standard next-token prediction where the first half of the sequence is excluded. This gives the lower performance bound.
+# - Standard next-token prediction where the full sequence is used. This gives a baseline performance when the entire sequence is used.
+#
+# We then tested four different methods of mixing memories with the current state:
+#
+# - Version 0: Basic linear projection of concatenated states with gating
+# - Version 1: Similar to v0 but with tanh activation before interpolation
+# - Version 2: Unscaled residual connection approach with logit space modifications
+# - Version 3: Simple interpolation between memory and current state (performed best)
+#
+# Over 3 seeds with each method, version 3 achieved the best validation loss of the different mixing methods.
+# It performed only slightly worse than the baseline with the full sequence.
+# Note that as the architecture and training procedure changes, it may be necessary to retest different memory mixing methods.
+# In particular, a more complex mixing method may be necessary when we get to the point where gradients are not able to be directly
+# backpropagated through the memory recurrent states.
+#
+# Run experiments with:
 #
 #   Baselines:
 #     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=4 --use_wandb
@@ -31,7 +54,6 @@ from tqdm import tqdm
 import wandb
 
 from model import BatchLinear, MultiLayerRNN
-from tokenization import CharacterTokenizer
 
 
 # Repetitive phrases to remove from the TinyStories dataset
@@ -128,14 +150,6 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         # Scale factor for attention
         self.scale = math.sqrt(key_dim)
         
-        # mlp_ratio = getattr(self, 'mlp_ratio', 4.0)
-        
-        # hidden_dim = int(self.d_gru_hidden * mlp_ratio)
-        # self.gate_proj = BatchLinear(2 * self.d_gru_hidden, hidden_dim, len(self.layers), bias=False)
-        # self.up_proj = BatchLinear(2 * self.d_gru_hidden, hidden_dim, len(self.layers), bias=False)
-        # self.down_proj = BatchLinear(hidden_dim, self.d_gru_hidden, len(self.layers), bias=False)
-        # self.act_fn = nn.SiLU()
-        
         self.mod_proj = BatchLinear(2 * self.d_gru_hidden, self.d_gru_hidden, len(self.layers))
         self.alpha_proj = BatchLinear(2 * self.d_gru_hidden, self.d_gru_hidden, len(self.layers))
         
@@ -183,28 +197,6 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         mixed_memories = mixed_memories.sum(dim=1)
         
         return mixed_memories, attn_weights
-        
-    # def integrate_memories(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
-    #     """Integrate memories with current state using MLP with gating.
-        
-    #     Args:
-    #         current_states: Current hidden state tensor of shape (batch_size, n_gru_layers, hidden_dim)
-    #         memory_states: Memory tensor of shape (batch_size, n_gru_layers, hidden_dim)
-            
-    #     Returns:
-    #         Modified current states tensor of shape (batch_size, n_gru_layers, hidden_dim)
-    #     """
-    #     input_states = torch.cat([current_states, memory_states], dim=2)
-        
-    #     # MLP with gating
-    #     gate_output = self.act_fn(self.gate_proj(input_states))
-    #     up_output = self.up_proj(input_states)
-    #     state_modifications = self.down_proj(gate_output * up_output)
-
-    #     modified_states = torch.atanh(current_states) + state_modifications
-    #     modified_states = torch.tanh(modified_states)
-        
-    #     return modified_states
 
     def integrate_memories_v0(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
         input_states = torch.cat([current_states, memory_states], dim=2)
@@ -230,21 +222,6 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         modified_states = alpha * modified_state + (1 - alpha) * current_states
         
         return modified_states
-
-    # def integrate_memories_v2(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
-    #     input_states = torch.cat([current_states, memory_states], dim=2)
-        
-    #     state_modifications = self.mod_proj(input_states)
-    #     modified_states = torch.atanh(torch.clamp(current_states, -0.999999, 0.999999)) + state_modifications
-    #     modified_states = torch.tanh(modified_states)
-        
-    #     alpha_inputs = torch.cat([current_states, modified_states], dim=2)
-    #     alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
-        
-    #     # Interpolate between current state and modified state
-    #     modified_states = alpha * torch.tanh(modified_states) + (1 - alpha) * current_states
-        
-    #     return modified_states
     
     def integrate_memories_v2(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
         """Unscale and modify the current state with a residual connection before passing back through a tanh."""
@@ -305,7 +282,6 @@ if __name__ == '__main__':
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer = CharacterTokenizer()
 
     train_loader, val_loader = prepare_dataloaders(tokenizer, args)
 
@@ -378,42 +354,15 @@ if __name__ == '__main__':
                 # TODO: Consider prepending a memory token to the memory input ids
                 _, memory_hidden_states = model(memory_input_ids)
                 
-                # bos_tokens = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long).repeat(batch_size, 1).to(device)
-                # memory_input_ids = torch.cat([bos_tokens, memory_input_ids], dim=1)
-                # ignore_tokens = torch.tensor([[-100]], dtype=torch.long).repeat(batch_size, 1).to(device)
-                # memory_target_ids = torch.cat([ignore_tokens, memory_target_ids], dim=1)
-                
-                # memory_logits, _ = model(memory_input_ids, memory_hidden_states)
-
-                # recon_loss = nn.functional.cross_entropy(
-                #     memory_logits.view(-1, memory_logits.size(-1)), 
-                #     memory_target_ids.reshape(-1),
-                #     ignore_index=-100,
-                # )
                 recon_loss = torch.tensor(0.0)
                 attn_accuracy = torch.tensor(0.0)
 
                 ### Use query states to retrieve matching memory states ###
                     
                 _, query_states = model(query_input_ids)
-                
-                
-                # retrieved_states, attn_weights = model.query_memories(
-                #     rearrange(query_states, 'l b 1 d -> b l d'),
-                #     # rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1),
-                #     rearrange(memory_hidden_states, 'l b 1 d -> b 1 l d'),
-                # )
-                
-                # correct_weights = torch.arange(batch_size).unsqueeze(1).repeat(1, len(model.layers))
-                # attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
-                # batch_attn_accuracies.append(attn_accuracy.item())
-            
                 integrated_states = model.integrate_memories(
                     rearrange(query_states, 'l b 1 d -> b l d'), rearrange(memory_hidden_states, 'l b 1 d -> b l d'))
-                    # retrieved_states)
-                
                 integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
-                
             else:
                 if args.full_sequence:
                     _, start_states = model(memory_input_ids)
@@ -489,9 +438,6 @@ if __name__ == '__main__':
                     input_ids = batch['input_ids'].to(device)
                     target_ids = batch['labels'].to(device)
                     batch_size = input_ids.shape[0]
-                    
-                    # memory_input_ids, query_input_ids, prediction_input_ids = input_ids.chunk(3, dim=1)
-                    # memory_target_ids, query_target_ids, prediction_target_ids = target_ids.chunk(3, dim=1)
 
                     memory_input_ids, query_input_ids, prediction_input_ids = torch.tensor_split(input_ids, [input_ids.shape[1]//2, 3*input_ids.shape[1]//4], dim=1)
                     memory_target_ids, query_target_ids, prediction_target_ids = torch.tensor_split(target_ids, [target_ids.shape[1]//2, 3*target_ids.shape[1]//4], dim=1)
@@ -500,31 +446,12 @@ if __name__ == '__main__':
                         if args.integrate_memory:
                             # Form memories
                             _, memory_hidden_states = model(memory_input_ids)
-                            # memory_logits, _ = model(memory_input_ids, memory_hidden_states)
-
-                            # recon_loss = nn.functional.cross_entropy(
-                            #     memory_logits.view(-1, memory_logits.size(-1)), 
-                            #     memory_target_ids.reshape(-1),
-                            #     ignore_index=-100,
-                            # )
                             recon_loss = torch.tensor(0.0)
 
                             # Query and retrieve memories
                             _, query_states = model(query_input_ids)
-                            
-                            # retrieved_states, attn_weights = model.query_memories(
-                            #     rearrange(query_states, 'l b 1 d -> b l d'),
-                            #     rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1),
-                            # )
-                            
-                            # correct_weights = torch.arange(batch_size).unsqueeze(1).repeat(1, len(model.layers))
-                            # attn_accuracy = (attn_weights.cpu().argmax(dim=2) == correct_weights).float().mean()
-                            # val_attn_accuracies.append(attn_accuracy.item())
-
                             integrated_states = model.integrate_memories(
                                 rearrange(query_states, 'l b 1 d -> b l d'), rearrange(memory_hidden_states, 'l b 1 d -> b l d'))
-                                # retrieved_states)
-                            
                             integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
                         else:
                             if args.full_sequence:
