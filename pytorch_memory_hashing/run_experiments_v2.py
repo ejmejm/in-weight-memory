@@ -1,6 +1,19 @@
 ### Experiment Set 2 ###
 #
 # The purpose of this file is to run experiments to 
+#
+#
+# Ran experiments with:
+#
+#   Baselines:
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=4 --use_wandb
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=4 --full_sequence --use_wandb
+#
+#   Memory integration methods:
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=0 --use_wandb
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=1 --use_wandb
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=2 --use_wandb
+#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=3 --use_wandb
 
 
 import argparse
@@ -104,7 +117,8 @@ def prepare_dataloaders(tokenizer, args):
 
 
 class MultiLayerRNNWithAttn(MultiLayerRNN):
-    def __init__(self, *args, key_dim=None, **kwargs):
+    
+    def __init__(self, *args, key_dim=None, integrate_memory_version='0', **kwargs):
         super().__init__(*args, **kwargs)
         # Create attention layers for each GRU layer
         key_dim = key_dim or self.d_gru_hidden
@@ -124,6 +138,15 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         
         self.mod_proj = BatchLinear(2 * self.d_gru_hidden, self.d_gru_hidden, len(self.layers))
         self.alpha_proj = BatchLinear(2 * self.d_gru_hidden, self.d_gru_hidden, len(self.layers))
+        
+        integrate_memories_version_map = {
+            '0': self.integrate_memories_v0,
+            '1': self.integrate_memories_v1,
+            '2': self.integrate_memories_v2,
+            '3': self.integrate_memories_v3,
+        }
+        print(f'Using integrate memories version {integrate_memory_version}')
+        self.integrate_memories = integrate_memories_version_map[integrate_memory_version]
         
     def query_memories(self, current_state: torch.Tensor, memories: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Integrate memories with current state using attention mechanism.
@@ -183,7 +206,7 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         
     #     return modified_states
 
-    def integrate_memories(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+    def integrate_memories_v0(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
         input_states = torch.cat([current_states, memory_states], dim=2)
         
         modified_state = self.mod_proj(input_states)
@@ -193,6 +216,56 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         # Interpolate between current state and modified state
         modified_states = alpha * torch.tanh(modified_state) + (1 - alpha) * current_states
         
+        return modified_states
+    
+    def integrate_memories_v1(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+        """Create a new state with a linear projection, then interpolate with the current state."""
+        input_states = torch.cat([current_states, memory_states], dim=2)
+        
+        modified_state = torch.tanh(self.mod_proj(input_states))
+        alpha_inputs = torch.cat([current_states, modified_state], dim=2)
+        alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
+        
+        # Interpolate between current state and modified state
+        modified_states = alpha * modified_state + (1 - alpha) * current_states
+        
+        return modified_states
+
+    # def integrate_memories_v2(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+    #     input_states = torch.cat([current_states, memory_states], dim=2)
+        
+    #     state_modifications = self.mod_proj(input_states)
+    #     modified_states = torch.atanh(torch.clamp(current_states, -0.999999, 0.999999)) + state_modifications
+    #     modified_states = torch.tanh(modified_states)
+        
+    #     alpha_inputs = torch.cat([current_states, modified_states], dim=2)
+    #     alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
+        
+    #     # Interpolate between current state and modified state
+    #     modified_states = alpha * torch.tanh(modified_states) + (1 - alpha) * current_states
+        
+    #     return modified_states
+    
+    def integrate_memories_v2(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+        """Unscale and modify the current state with a residual connection before passing back through a tanh."""
+        current_state_logits = torch.atanh(torch.clamp(current_states, -0.999999, 0.999999))
+        mem_state_logits = torch.atanh(torch.clamp(memory_states, -0.999999, 0.999999))
+        input_states = torch.cat([current_state_logits, mem_state_logits], dim=2)
+        
+        state_modifications = self.mod_proj(input_states)
+        gate_inputs = torch.cat([current_state_logits, state_modifications], dim=2)
+        gate_values = torch.sigmoid(self.alpha_proj(gate_inputs))
+
+        modified_states = current_state_logits + gate_values * state_modifications
+        modified_states = torch.tanh(modified_states)
+        
+        return modified_states
+    
+    def integrate_memories_v3(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+        """Interpolate between current state and memory state."""
+        alpha_inputs = torch.cat([current_states, memory_states], dim=2)
+        alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
+        modified_states = alpha * memory_states + (1 - alpha) * current_states
         return modified_states
 
 
@@ -217,6 +290,8 @@ def parse_args():
                         help='Model must choose which hidden state to use from a batch of hidden states.'
                              'Exactly one of the hidden states from the pool of \{batch_size\} hidden states'
                              'will be useful.')
+    parser.add_argument('--integrate_memory_version', type=str, default='0',
+                        help='Version of the integrate memories function to use.')
     return parser.parse_args()
 
 
@@ -247,6 +322,7 @@ if __name__ == '__main__':
     
     if args.integrate_memory:
         model_kwargs['key_dim'] = args.d_model // 4
+        model_kwargs['integrate_memory_version'] = args.integrate_memory_version
 
     # Initialize model
     model = model_cls(**model_kwargs).to(device)
@@ -301,6 +377,12 @@ if __name__ == '__main__':
                 
                 # TODO: Consider prepending a memory token to the memory input ids
                 _, memory_hidden_states = model(memory_input_ids)
+                
+                # bos_tokens = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long).repeat(batch_size, 1).to(device)
+                # memory_input_ids = torch.cat([bos_tokens, memory_input_ids], dim=1)
+                # ignore_tokens = torch.tensor([[-100]], dtype=torch.long).repeat(batch_size, 1).to(device)
+                # memory_target_ids = torch.cat([ignore_tokens, memory_target_ids], dim=1)
+                
                 # memory_logits, _ = model(memory_input_ids, memory_hidden_states)
 
                 # recon_loss = nn.functional.cross_entropy(
@@ -429,17 +511,19 @@ if __name__ == '__main__':
 
                             # Query and retrieve memories
                             _, query_states = model(query_input_ids)
-                            retrieved_states, attn_weights = model.query_memories(
-                                rearrange(query_states, 'l b 1 d -> b l d'),
-                                rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1),
-                            )
                             
-                            correct_weights = torch.arange(batch_size).unsqueeze(1).repeat(1, len(model.layers))
-                            attn_accuracy = (attn_weights.cpu().argmax(dim=2) == correct_weights).float().mean()
-                            val_attn_accuracies.append(attn_accuracy.item())
-                        
+                            # retrieved_states, attn_weights = model.query_memories(
+                            #     rearrange(query_states, 'l b 1 d -> b l d'),
+                            #     rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1),
+                            # )
+                            
+                            # correct_weights = torch.arange(batch_size).unsqueeze(1).repeat(1, len(model.layers))
+                            # attn_accuracy = (attn_weights.cpu().argmax(dim=2) == correct_weights).float().mean()
+                            # val_attn_accuracies.append(attn_accuracy.item())
+
                             integrated_states = model.integrate_memories(
-                                rearrange(query_states, 'l b 1 d -> b l d'), retrieved_states)
+                                rearrange(query_states, 'l b 1 d -> b l d'), rearrange(memory_hidden_states, 'l b 1 d -> b l d'))
+                                # retrieved_states)
                             
                             integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
                         else:
