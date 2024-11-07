@@ -14,6 +14,11 @@
 #     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=1 --use_wandb
 #     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=2 --use_wandb
 #     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=3 --use_wandb
+# 
+# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=1 --use_wandb
+# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=2 --use_wandb
+# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=4 --use_wandb
+# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=8 --use_wandb
 
 
 import argparse
@@ -25,6 +30,7 @@ from einops import rearrange
 from transformers import GPT2Tokenizer
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
@@ -87,7 +93,7 @@ def collate_batch(batch, tokenizer, max_length):
 def prepare_dataloaders(tokenizer, args):
     # Load dataset
     dataset = load_dataset('roneneldan/TinyStories')
-    dataset['train'] = dataset['train'].select(range(100000))
+    dataset['train'] = dataset['train'].select(range(1000000))
 
     # Split into train and validation
     val_size = min(1000, int(len(dataset['train']) * 0.1))
@@ -156,10 +162,15 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         # Shape: (batch_size, n_layers, n_memories)
         scores = (keys.transpose(1, 2) @ queries.unsqueeze(3)).squeeze(3) / self.scale
         
-        # Apply softmax to get attention weights
-        # Shape: (batch_size, n_layers, n_memories) 
-        attn_weights = torch.softmax(scores, dim=2)
-        
+        if args.sparse_attention:
+            # Select only one memory (i.e. one-hot vectors)
+            # Shape: (batch_size, n_layers, n_memories)
+            attn_weights = F.gumbel_softmax(scores, dim=2, hard=True)
+        else:
+            # Apply softmax to get attention weights
+            # Shape: (batch_size, n_layers, n_memories) 
+            attn_weights = torch.softmax(scores, dim=2)
+
         # Mix memories using attention weights
         # Shape: (batch_size, n_layers, hidden_dim)
         mixed_memories = attn_weights.permute(0, 2, 1).unsqueeze(3) * memories
@@ -206,8 +217,16 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
     _, query_states = model(query_input_ids)
     
     
-    if args.multiple_memories:
+    if args.multiple_memories and args.memory_pool_size >= 1:
         memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1)
+        
+        # Select indices ([0, i:i+args.memory_pool_size], [1, i:i+args.memory_pool_size], ...)
+        dim1_indices =  torch.arange(batch_size).unsqueeze(1)
+        dim2_indices = ((
+            torch.arange(args.memory_pool_size).unsqueeze(0).repeat(batch_size, 1) \
+            + torch.arange(batch_size).unsqueeze(1)
+        ) % batch_size)
+        memory_pool = memory_pool[dim1_indices, dim2_indices]
     else:
         memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> b 1 l d')
 
@@ -215,7 +234,7 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
         rearrange(query_states, 'l b 1 d -> b l d'), memory_pool)
     
     if args.multiple_memories:
-        correct_weights = torch.arange(batch_size).unsqueeze(1).repeat(1, len(model.layers))
+        correct_weights = torch.zeros((batch_size, len(model.layers)))
         attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
     else:
         attn_accuracy = torch.tensor(float('nan'))
@@ -272,7 +291,14 @@ def parse_args():
                              'will be useful.')
     parser.add_argument('--memory_recon_loss', action='store_true', default=False,
                         help='Use a reconstruction loss on the memory states.')
-    return parser.parse_args()
+    parser.add_argument('--memory_pool_size', type=int, default=None,
+                        help='Number of memories to attend over. Default is batch size.')
+    parser.add_argument('--sparse_attention', action='store_true', default=False,
+                        help='Use a sparse attention mechanism to attend over the memory pool.')
+    
+    args = parser.parse_args()
+    args.memory_pool_size = args.memory_pool_size or args.batch_size
+    return args
 
 
 if __name__ == '__main__':
