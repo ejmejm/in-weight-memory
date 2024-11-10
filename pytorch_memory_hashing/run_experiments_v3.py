@@ -1,24 +1,34 @@
 ### Experiment Set 3 ###
 #
-# The purpose of this file is to run experiments to 
+# In this set of experiments, we vary the numbers of memories (past recurrent states) that the model attends to.
+# In all experiments (with the execption of the no-memory baseline), there is exactly one memory in the pool that is useful for the current sequence.
+# The remaining memories are not relevant, and the model must learn to ignore them.
+# We tested memory pool sizes of 1, 2, 4, 8, 16, and 32. As expected, the performance of the model decreases as the number of irrelevant memories increases.
+# However, even with 32 irrelevant memories, the model is still able to gain a significant performance boost from integrating memories.
+# 
+# We also tested how sparse attention, where the model can only attend to a single memory (via a straight-through estimator), affects performance.
+# Sparse attention seemed to either have a negative or no effect on performance. More experiments would be required to know for certain.
 #
 #
 # Ran experiments with:
 #
 #   Baselines:
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=4 --use_wandb
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=4 --full_sequence --use_wandb
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=0 --memory_recon_loss --use_wandb
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=1 --memory_recon_loss --use_wandb
 #
-#   Memory integration methods:
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=0 --use_wandb
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=1 --use_wandb
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=2 --use_wandb
-#     python run_experiments_v2.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --integrate_memory --epochs=4 --integrate_memory_version=3 --use_wandb
-# 
-# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=1 --use_wandb
-# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=2 --use_wandb
-# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=4 --use_wandb
-# python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=8 --use_wandb
+#   Varying memory pool size:
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=2 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=4 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=8 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=16 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=32 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=64 --memory_recon_loss --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=2 --memory_recon_loss --sparse_attention --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=4 --memory_recon_loss --sparse_attention --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=8 --memory_recon_loss --sparse_attention --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=16 --memory_recon_loss --sparse_attention --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=32 --memory_recon_loss --sparse_attention --use_wandb; \
+#     python run_experiments_v3.py --batch_size=64 --d_model=768 --expansion_factor=2 --max_length=128 --epochs=1 --multiple_memories --memory_pool_size=64 --memory_recon_loss --sparse_attention --use_wandb
 
 
 import argparse
@@ -209,6 +219,8 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
             memory_target_ids.reshape(-1),
             ignore_index=-100,
         )
+        
+        memory_hidden_states = memory_hidden_states.detach()
     else:
         recon_loss = torch.tensor(float('nan'))
 
@@ -216,32 +228,35 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
         
     _, query_states = model(query_input_ids)
     
-    
-    if args.multiple_memories and args.memory_pool_size >= 1:
-        memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1)
-        
-        # Select indices ([0, i:i+args.memory_pool_size], [1, i:i+args.memory_pool_size], ...)
-        dim1_indices =  torch.arange(batch_size).unsqueeze(1)
-        dim2_indices = ((
-            torch.arange(args.memory_pool_size).unsqueeze(0).repeat(batch_size, 1) \
-            + torch.arange(batch_size).unsqueeze(1)
-        ) % batch_size)
-        memory_pool = memory_pool[dim1_indices, dim2_indices]
-    else:
-        memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> b 1 l d')
-
-    retrieved_states, attn_weights = model.query_memories(
-        rearrange(query_states, 'l b 1 d -> b l d'), memory_pool)
-    
-    if args.multiple_memories:
-        correct_weights = torch.zeros((batch_size, len(model.layers)))
-        attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
-    else:
+    if args.memory_pool_size == 0:
+        integrated_states = query_states
         attn_accuracy = torch.tensor(float('nan'))
+    else:
+        if args.multiple_memories and args.memory_pool_size >= 1:
+            memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1)
+            
+            # Select indices ([0, i:i+args.memory_pool_size], [1, i:i+args.memory_pool_size], ...)
+            dim1_indices =  torch.arange(batch_size).unsqueeze(1)
+            dim2_indices = ((
+                torch.arange(args.memory_pool_size).unsqueeze(0).repeat(batch_size, 1) \
+                + torch.arange(batch_size).unsqueeze(1)
+            ) % batch_size)
+            memory_pool = memory_pool[dim1_indices, dim2_indices]
+        else:
+            memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> b 1 l d')
 
-    integrated_states = model.integrate_memories(
-        rearrange(query_states, 'l b 1 d -> b l d'), retrieved_states)
-    integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
+        retrieved_states, attn_weights = model.query_memories(
+            rearrange(query_states, 'l b 1 d -> b l d'), memory_pool)
+    
+        if args.multiple_memories:
+            correct_weights = torch.zeros((batch_size, len(model.layers)))
+            attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
+        else:
+            attn_accuracy = torch.tensor(float('nan'))
+
+        integrated_states = model.integrate_memories(
+            rearrange(query_states, 'l b 1 d -> b l d'), retrieved_states)
+        integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
         
 
     ### Use retrieved states to predict next token ###
@@ -297,7 +312,7 @@ def parse_args():
                         help='Use a sparse attention mechanism to attend over the memory pool.')
     
     args = parser.parse_args()
-    args.memory_pool_size = args.memory_pool_size or args.batch_size
+    args.memory_pool_size = args.batch_size if args.memory_pool_size is None else args.memory_pool_size
     return args
 
 
