@@ -2,5 +2,6 @@ legacy/
 **/__pycache__/
 .vscode/
 **/wandb/
+outputs/
 
-lstm_scaling_experiment.ipynb
+jax_associative_recall/lstm_scaling_experiment.ipynb
