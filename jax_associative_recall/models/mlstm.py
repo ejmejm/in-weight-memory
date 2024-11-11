@@ -234,6 +234,135 @@ class mLSTMCell(eqx.Module, strict=True):
         return mLSTMState(h, c, m, n, cell_history, cell_step + 1), h.reshape(self.hidden_size)
 
 
+    def parallel_forward(
+        self,
+        input: Array,
+        rnn_state: mLSTMState,
+        v_input: Optional[Array] = None,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+    ) -> Tuple[mLSTMState, Array]:
+        """
+        Args:
+            input: The input, which should be a JAX array of shape `(sequence_len, input_size,)`.
+            rnn_state: A 3-tuple containing the h, c, and n states.
+            v_input: The input to the value layer, which should be a JAX array of shape `(sequence_len, hidden_size,)`.
+                `separate_value_input` must be set to True on class instantiation for this to take effect.
+            key: Ignored; provided for compatibility with the rest of the Equinox API.
+                (Keyword only argument.)
+
+        Returns:
+            The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
+            `(hidden_size,)`.
+        """
+        prev_h, prev_c, prev_m, prev_n, prev_cell_history, cell_step = rnn_state
+
+        # Calculate gate values
+        ifr = jnp.inner(self.ifr_weights, input) # (n_heads, 3, sequence_len)
+        o = self.o_weights @ input.T # (n_heads, head_size, sequence_len)
+
+        if self.use_bias:
+            ifr += self.ifr_bias[:, :, None]
+            o += self.o_bias[:, :, None]
+
+        i, f, r = ifr.permute(1, 0, 2)
+
+        # Steps for creating the forget matrix per head:
+        #   1. Pass the forget gates through a sigmoid
+        #   2. Create a (seq_len, seq_len) matrix where each column is the sequence of forget gates
+        #   3. Set the upper triangular and diagonal to 1
+        #   4. Do a cumulative product along axis 1
+        #   5. Set the upper triangular to 0
+        
+        f = jnp.sigmoid(f)
+        forget_matrix = f.repeat(f.shape[1], axis=1).reshape(f.shape[0], f.shape[1], f.shape[1])
+        forget_matrix = jnp.tril(forget_matrix - 1, k=-1) + 1
+        forget_matrix = jnp.cumprod(forget_matrix, axis=1)
+        forget_matrix = jnp.tril(forget_matrix)
+        
+        # Next create the input matrix
+        # For each head this is just a (seq_len, seq_len) matrix where each row is the sequence of input gates,
+        # and upper triangular is 0
+        input_matrix = i.repeat(i.shape[1], axis=0).reshape(i.shape[0], i.shape[1], i.shape[1])
+        input_matrix = jnp.tril(input_matrix)
+        
+        gate_activation_matrix = jnp.log(forget_matrix) * input_matrix
+        # TODO: Check if this is correct, may need to subtract the max per head
+        gate_activation_matrix = jnp.exp(gate_activation_matrix - jnp.max(gate_activation_matrix))
+        
+        ##### Left off here
+        
+        o = jnn.sigmoid(o)
+
+        i, f, r = ifr.T
+        m = jnp.maximum(f + prev_m, i)
+        i = jnp.exp(i - m)
+        f = jnp.exp(f + prev_m - m)
+        r = jnn.sigmoid(r)
+
+        if not self.separate_value_input:
+            v_input = input
+
+        # Calculate keys, values, and queries from normalized inputs
+        kq = self.kq_weights @ input
+        k, q = jnp.split(kq, 2, axis=1)
+        v = self.v_weights @ v_input
+        k *= 1.0 / jnp.sqrt(self.head_size)
+
+        if self.use_bias:
+            k_bias, v_bias, q_bias = self.kvq_bias.transpose(1, 0, 2)
+            k += k_bias
+            v += v_bias
+            q += q_bias
+
+        # Calculate recurrent values
+        n = f[:, None] * prev_n + i[:, None] * k
+        c = f[:, None, None] * prev_c + i[:, None, None] * v[:, :, None] @ k[:, None, :]
+
+        
+        def update_cell_history():
+            cell_history = jnp.roll(prev_cell_history, -1, axis=0)
+            cell_history = cell_history.at[-1].set(c)
+            return cell_history
+
+        cell_history = jax.lax.cond(
+            cell_step % 20 == 0,
+            update_cell_history,
+            lambda: prev_cell_history,
+        )
+
+
+        ####### Calculate retrieval from history #######
+
+        # self.mem_kvq_weights # (n_heads, 3, self.head_size)
+        # c_hist # (sequence_len, self.n_heads, self.head_size, self.head_size)
+
+
+        # (sequence_len, self.n_heads, 3, self.head_size)
+        mem_kvq = self.mem_kvq_weights[None] @ cell_history
+        mem_kvq += self.mem_kvq_bias[None]
+
+        k, v, _ = rearrange(mem_kvq, 's nh l hs -> l s nh hs')
+
+        query_result = batch_dot(q[-1:], k) / jnp.sqrt(self.head_size) # -> (s, nh)
+        attn_weights = jnn.softmax(query_result, axis=0)
+        attn_out = jnp.sum(attn_weights[:, :, None, None] * cell_history, axis=0) # -> (nh, hs, hs)
+
+        ########
+
+
+        # c += r[:, None, None] * attn_out
+
+        h = (c @ q[:, :, None]).squeeze(2) + r[:, None] * (attn_out @ q[:, :, None]).squeeze(2)
+        h /= jnp.maximum(
+            jnp.abs(n[:, None, :] @ q[:, :, None]).squeeze((1, 2,)),
+            jnp.ones(self.n_heads, dtype=int),
+        )[:, None]
+        h = o * h
+
+        return mLSTMState(h, c, m, n, cell_history, cell_step + 1), h.reshape(self.hidden_size)
+
+
 class mLSTMBlock(eqx.Module):
     """A block of scaled Long-Short Term Memory units (mLSTM) with normalization and projection layers.
 
