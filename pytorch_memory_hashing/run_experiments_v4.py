@@ -171,25 +171,40 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
 
         return x, torch.stack(next_hidden_states)
 
-    def query_memories(self, current_state: torch.Tensor, memories: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def query_memories(
+        self,
+        current_state: torch.Tensor,
+        memories: torch.Tensor,
+        layer_idx: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Integrate memories with current state using attention mechanism.
         
         Args:
-            current_state: Current hidden state tensor of shape (batch_size, n_gru_layers, hidden_dim)
-            memories: Memory tensor of shape (batch_size, n_memories, n_gru_layers, hidden_dim)
-            
+            current_state: Current hidden state tensor of shape (batch_size, n_gru_layers, hidden_dim),
+                or of shape (batch_size, hidden_dim) if layer_idx is specified
+            memories: Memory tensor of shape (batch_size, n_memories, n_gru_layers, hidden_dim),
+                or of shape (batch_size, n_memories, hidden_dim) if layer_idx is specified
+            layer_idx: Optional index to select a specific layer
+
         Returns:
             tuple of:
-                - Mixed memories tensor of shape (batch_size, n_gru_layers, hidden_dim)
-                - Attention weights of shape (batch_size, n_gru_layers, n_memories)
+                - Mixed memories tensor of shape (batch_size, n_gru_layers, hidden_dim),
+                    or of shape (batch_size, hidden_dim) if layer_idx is specified
+                - Attention weights of shape (batch_size, n_gru_layers, n_memories),
+                    or of shape (batch_size, n_memories) if layer_idx is specified
         """        
         # Compute queries from current state
-        # Shape: (batch_size, n_layers, hidden_dim)
-        queries = self.query_proj(current_state)
+        # Shape: (batch_size, (optional) n_layers, hidden_dim)
+        queries = self.query_proj(current_state, layer_idx)
         
         # Compute keys from memories
-        # Shape: (batch_size, n_memories, n_layers, hidden_dim)
-        keys = self.key_proj(memories)
+        # Shape: (batch_size, n_memories, (optional) n_layers, hidden_dim)
+        keys = self.key_proj(memories, layer_idx)
+        
+        if layer_idx is not None:
+            queries = queries.unsqueeze(1)
+            keys = keys.unsqueeze(2)
+            memories = memories.unsqueeze(2)
         
         # Compute attention scores
         # (batch_size, n_layers, n_memories, hidden_dim) @ (batch_size, n_layers, hidden_dim, 1)
@@ -210,20 +225,37 @@ class MultiLayerRNNWithAttn(MultiLayerRNN):
         mixed_memories = attn_weights.permute(0, 2, 1).unsqueeze(3) * memories
         mixed_memories = mixed_memories.sum(dim=1)
         
+        if layer_idx is not None:
+            mixed_memories = mixed_memories.squeeze(1)
+            attn_weights = attn_weights.squeeze(1)
+        
         return mixed_memories, attn_weights
     
-    def integrate_memories(self, current_states: torch.Tensor, memory_states: torch.Tensor) -> torch.Tensor:
+    def integrate_memories(
+        self,
+        current_states: torch.Tensor,
+        memory_states: torch.Tensor,
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
         """Interpolate between current state and memory state.
         
         Args:
-            current_states: Current hidden state tensor of shape (batch_size, n_gru_layers, hidden_dim)
-            memory_states: Memory tensor of shape (batch_size, n_gru_layers, hidden_dim)
+            current_states: Current hidden state tensor of shape (batch_size, n_gru_layers, hidden_dim),
+                or of shape (batch_size, hidden_dim) if layer_idx is specified
+            memory_states: Memory tensor of shape (batch_size, n_gru_layers, hidden_dim),
+                or of shape (batch_size, hidden_dim) if layer_idx is specified
+            layer_idx: Optional index to select a specific layer
             
         Returns:
-            Modified hidden states tensor of shape (batch_size, n_gru_layers, hidden_dim)
+            Modified hidden states tensor of shape (batch_size, n_gru_layers, hidden_dim),
+                or of shape (batch_size, hidden_dim) if layer_idx is specified
         """
-        alpha_inputs = torch.cat([current_states, memory_states], dim=2)
-        alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
+        if layer_idx is None:
+            alpha_inputs = torch.cat([current_states, memory_states], dim=2)
+            alpha = torch.sigmoid(self.alpha_proj(alpha_inputs))
+        else:
+            alpha_inputs = torch.cat([current_states, memory_states], dim=1)
+            alpha = torch.sigmoid(self.alpha_proj(alpha_inputs, layer_idx))
         modified_states = alpha * memory_states + (1 - alpha) * current_states
         return modified_states
 
@@ -265,8 +297,39 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
             integrated_states = query_states
             attn_accuracy = torch.tensor(float('nan'))
         else:
-            if args.memory_pool_size >= 1:
-                memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1)
+            memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> 1 b l d').repeat(batch_size, 1, 1, 1)
+            
+            # Select indices ([0, i:i+args.memory_pool_size], [1, i:i+args.memory_pool_size], ...)
+            dim1_indices =  torch.arange(batch_size).unsqueeze(1)
+            dim2_indices = ((
+                torch.arange(args.memory_pool_size).unsqueeze(0).repeat(batch_size, 1) \
+                + torch.arange(batch_size).unsqueeze(1)
+            ) % batch_size)
+            memory_pool = memory_pool[dim1_indices, dim2_indices]
+
+            retrieved_states, attn_weights = model.query_memories(
+                rearrange(query_states, 'l b 1 d -> b l d'), memory_pool)
+        
+            correct_weights = torch.zeros((batch_size, len(model.layers)))
+            attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
+
+            integrated_states = model.integrate_memories(
+                rearrange(query_states, 'l b 1 d -> b l d'), retrieved_states)
+            integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
+    else:
+        _, query_states = model(query_input_ids[:, :-1])
+        
+        attn_accuracy = None
+        
+        def integrate_memories_fn(layer_idx, hidden_states):
+            nonlocal attn_accuracy
+            
+            if args.memory_pool_size == 0:
+                attn_accuracy = torch.tensor(float('nan'))
+                return hidden_states
+            
+            else:
+                memory_pool = rearrange(memory_hidden_states[layer_idx], 'b 1 d -> 1 b d').repeat(batch_size, 1, 1)
                 
                 # Select indices ([0, i:i+args.memory_pool_size], [1, i:i+args.memory_pool_size], ...)
                 dim1_indices =  torch.arange(batch_size).unsqueeze(1)
@@ -275,26 +338,20 @@ def compute_losses_and_metrics(model, input_ids, target_ids, args):
                     + torch.arange(batch_size).unsqueeze(1)
                 ) % batch_size)
                 memory_pool = memory_pool[dim1_indices, dim2_indices]
-            else:
-                memory_pool = rearrange(memory_hidden_states, 'l b 1 d -> b 1 l d')
 
-            retrieved_states, attn_weights = model.query_memories(
-                rearrange(query_states, 'l b 1 d -> b l d'), memory_pool)
-        
-            if args.memory_pool_size >= 1:
-                correct_weights = torch.zeros((batch_size, len(model.layers)))
-                attn_accuracy = (attn_weights.detach().cpu().argmax(dim=2) == correct_weights).float().mean()
-            else:
-                attn_accuracy = torch.tensor(float('nan'))
+                # Make sure indexing the right memory pool here
+                retrieved_states, attn_weights = model.query_memories(hidden_states.squeeze(1), memory_pool, layer_idx)
+            
+                correct_weights = torch.zeros((batch_size,))
+                attn_accuracy = (attn_weights.detach().cpu().argmax(dim=1) == correct_weights).float().mean()
 
-            integrated_states = model.integrate_memories(
-                rearrange(query_states, 'l b 1 d -> b l d'), retrieved_states)
-            integrated_states = rearrange(integrated_states, 'b l d -> l b 1 d')
-    else:
-        print(query_input_ids.shape)
-        _, query_states = model(query_input_ids)
-        integrated_states = query_states
-        attn_accuracy = torch.tensor(float('nan'))
+                integrated_states = model.integrate_memories(
+                    rearrange(hidden_states, 'b 1 d -> b d'), retrieved_states, layer_idx)
+                integrated_states = rearrange(integrated_states, 'b d -> b 1 d')
+                
+                return integrated_states
+
+        _, integrated_states = model(query_input_ids[:, -1:], query_states, integrate_memories_fn)
 
     ### Use retrieved states to predict next token ###
     

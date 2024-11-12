@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union, List
+from typing import Callable, Optional, Tuple, List
 
 from minGRU_pytorch import minGRU
 import torch
@@ -36,14 +36,13 @@ class BatchLinear(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (..., n_layers, in_features)
-            
-        Returns:
-            Output tensor of shape (..., n_layers, out_features)
-        """
+    def _forward_single_layer(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        x = x @ self.weight[layer_idx]
+        if self.bias is not None:
+            x = x + self.bias[layer_idx]
+        return x
+    
+    def _forward_all_layers(self, x: torch.Tensor) -> torch.Tensor:
         # Save original shape and flatten all but last 2 dimensions
         orig_shape = x.shape
         x = x.reshape(-1, self.n_layers, self.in_features).transpose(0, 1) # (n_layers, batch_dim, in_features)
@@ -59,6 +58,20 @@ class BatchLinear(nn.Module):
         # Restore original dimensions
         x = x.reshape(*orig_shape[:-2], self.n_layers, self.out_features)
         return x
+    
+    def forward(self, x: torch.Tensor, layer_idx: Optional[int] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (..., n_layers, in_features), or of shape (..., in_features) if layer_idx is specified
+            layer_idx: Optional index to select a specific layer
+            
+        Returns:
+            Output tensor of shape (..., n_layers, out_features), or of shape (..., out_features) if layer_idx is specified
+        """
+        if layer_idx is not None:
+            return self._forward_single_layer(x, layer_idx)
+        return self._forward_all_layers(x)
+        
 
 
 class MultiHeadGRU(nn.Module):
@@ -77,7 +90,6 @@ class MultiHeadGRU(nn.Module):
             for _ in range(n_heads)
         ])
 
-        # Replace ModuleList of Linear layers with single BatchLinear
         if expansion_factor != 1.0:
             self.to_outs = BatchLinear(dim_inner, self.head_dim, n_heads, bias=False)
         else:
@@ -125,6 +137,7 @@ class GRUWrapper(nn.Module):
         self, 
         x: torch.Tensor, 
         prev_hidden: Optional[torch.Tensor] = None,
+        modify_hidden_out_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -134,6 +147,9 @@ class GRUWrapper(nn.Module):
         prev_hidden = prev_hidden.transpose(0, 1) if prev_hidden is not None else None
         out, hidden = self.gru(x, prev_hidden)
         next_prev_hidden = out[:, -1:, :]
+        
+        if modify_hidden_out_fn is not None:
+            out = modify_hidden_out_fn(out)
         
         out = self.to_out(out)
             
@@ -244,7 +260,8 @@ class RNNBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        prev_hidden: Optional[torch.Tensor] = None
+        prev_hidden: Optional[torch.Tensor] = None,
+        modify_hidden_out_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # First normalization and RNN
         residual = x
@@ -252,7 +269,7 @@ class RNNBlock(nn.Module):
         if self.use_min_gru:
             x, next_hidden = self.rnn(x, prev_hidden, return_next_prev_hidden=True)
         else:
-            x, next_hidden = self.rnn(x, prev_hidden)
+            x, next_hidden = self.rnn(x, prev_hidden, modify_hidden_out_fn=modify_hidden_out_fn)
         x = residual + x
         
         # Second normalization and MLP
@@ -322,7 +339,8 @@ class MultiLayerRNN(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        prev_hidden: Optional[List[torch.Tensor]] = None
+        prev_hidden: Optional[List[torch.Tensor]] = None,
+        modify_hidden_out_fn: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through the network
@@ -340,7 +358,11 @@ class MultiLayerRNN(nn.Module):
         
         for i, layer in enumerate(self.layers):
             layer_prev_hidden = prev_hidden[i] if prev_hidden is not None else None
-            x, next_hidden = layer(x, layer_prev_hidden)
+            if modify_hidden_out_fn is not None:
+                layer_modify_hidden_out_fn = lambda hidden: modify_hidden_out_fn(i, hidden)
+            else:
+                layer_modify_hidden_out_fn = None
+            x, next_hidden = layer(x, layer_prev_hidden, modify_hidden_out_fn=layer_modify_hidden_out_fn)
             next_hidden_states.append(next_hidden)
             
         x = self.norm(x)
